@@ -4,10 +4,10 @@ Personal finance tracker. Single-file Flask app with SQLite backend.
 
 ## Features
 
-- Transaction log with categories and payment methods (Conto, Paypal, Contanti, Libretto, Risparmio)
+- Transaction log with categories and payment methods
 - Monthly budget thresholds per category, with automatic rollover of unused budget to the following month
 - Cumulative balances per payment method across all time
-- Project budgets — fixed budgets for non-recurring expenses (e.g. driving licence, travel costs) tracked across months
+- Project budgets — fixed budgets for non-recurring expenses (e.g. travel costs) tracked across months
 - Spending trend alerts mid-month
 - Full backup and restore via JSON export
 
