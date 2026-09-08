@@ -106,11 +106,12 @@ def auto_rollover_if_needed(db, year, month):
     rows = db.execute(
         "SELECT category, SUM(amount) as s FROM transactions "
         "WHERE strftime('%Y',date)=? AND strftime('%m',date)=? "
-        "AND is_balance=0 AND amount<0 AND category!='' AND method!='Risparmio' "
+        "AND is_balance=0 AND category!='' AND method!='Risparmio' "
+        "AND project_id IS NULL "
         "GROUP BY category",
         (str(prev_y), f"{prev_m:02d}")
     ).fetchall()
-    spend = {r["category"]: abs(r["s"]) for r in rows}
+    net = {r["category"]: r["s"] for r in rows}
     cats = db.execute("SELECT name, threshold FROM categories WHERE threshold IS NOT NULL").fetchall()
     for c in cats:
         prev_co = db.execute(
@@ -118,7 +119,7 @@ def auto_rollover_if_needed(db, year, month):
             (prev_y, prev_m, c["name"])
         ).fetchone()
         eff = c["threshold"] + (prev_co["amount"] if prev_co else 0.0)
-        unused = round(eff - spend.get(c["name"], 0.0), 2)
+        unused = round(eff + net.get(c["name"], 0.0), 2)
         if abs(unused) > 0.01:
             db.execute(
                 "INSERT OR REPLACE INTO carryovers(year,month,category,amount) VALUES(?,?,?,?)",
@@ -245,11 +246,12 @@ def force_rollover():
     rows = db.execute(
         "SELECT category, SUM(amount) as s FROM transactions "
         "WHERE strftime('%Y',date)=? AND strftime('%m',date)=? "
-        "AND is_balance=0 AND amount<0 AND category!='' AND method!='Risparmio' "
+        "AND is_balance=0 AND category!='' AND method!='Risparmio' "
+        "AND project_id IS NULL "
         "GROUP BY category",
         (str(prev_y), f"{prev_m:02d}")
     ).fetchall()
-    spend = {r["category"]: abs(r["s"]) for r in rows}
+    net = {r["category"]: r["s"] for r in rows}
     cats = db.execute("SELECT name, threshold FROM categories WHERE threshold IS NOT NULL").fetchall()
     for c in cats:
         prev_co = db.execute(
@@ -257,7 +259,7 @@ def force_rollover():
             (prev_y, prev_m, c["name"])
         ).fetchone()
         eff = c["threshold"] + (prev_co["amount"] if prev_co else 0.0)
-        unused = round(eff - spend.get(c["name"], 0.0), 2)
+        unused = round(eff + net.get(c["name"], 0.0), 2)
         db.execute(
             "INSERT OR REPLACE INTO carryovers(year,month,category,amount) VALUES(?,?,?,?)",
             (year, month, c["name"], unused)
@@ -1106,15 +1108,17 @@ function renderCatList() {
 
 // ── Rollover ──
 async function calcRollover() {
-  const spend={};
-  STATE.txs.filter(t=>!t.is_balance&&t.category&&t.amount<0&&t.method!=='Risparmio').forEach(t=>{
-    spend[t.category]=(spend[t.category]||0)+Math.abs(t.amount);
+  let nm=curMonth+1, ny=curYear;
+  if(nm>12){nm=1;ny++;}
+  const net={};
+  STATE.txs.filter(t=>!t.is_balance&&t.category&&t.method!=='Risparmio'&&!t.project_id).forEach(t=>{
+    net[t.category]=(net[t.category]||0)+t.amount;  // somma con segno
   });
-  const co = STATE.coMap;  // ← questo mancava
+  const co = STATE.coMap;
   const items = STATE.cats.filter(c=>c.threshold).map(c=>{
-    const eff = c.threshold + (co[c.name]||0);   // budget effettivo = soglia + riporto entrata
-    const delta = parseFloat((eff - (spend[c.name]||0)).toFixed(2));
-    return {name:c.name, eff, delta};
+    const eff   = c.threshold + (co[c.name]||0);
+    const delta = parseFloat((eff + (net[c.name]||0)).toFixed(2));  // eff + somma netta
+    return {name:c.name, eff, spent: -(net[c.name]||0), delta};
   }).filter(c=>Math.abs(c.delta)>0.01);
 
   const prev=document.getElementById('rollover-preview');
@@ -1126,18 +1130,23 @@ async function calcRollover() {
   }
   prev.style.display='block';
   prev.innerHTML=`<div class="rollover-preview-box">
-    <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--muted);font-family:'DM Mono',monospace;padding-bottom:6px;margin-bottom:2px;border-bottom:1px solid var(--border)">
-      <span>CATEGORIA</span><span>BUDGET EFFETTIVO</span><span>SPESO</span><span>RIPORTO</span>
+    <div style="display:grid;grid-template-columns:1fr 90px 90px 90px;gap:0;font-size:10px;color:var(--muted);font-family:'DM Mono',monospace;padding-bottom:6px;margin-bottom:2px;border-bottom:1px solid var(--border);letter-spacing:.5px">
+      <span>CATEGORIA</span>
+      <span style="text-align:right">BUDGET</span>
+      <span style="text-align:right">SPESO</span>
+      <span style="text-align:right">RIPORTO</span>
     </div>
     ${items.map(u=>`
-    <div class="rollover-item">
-      <span style="color:var(--muted2)">${u.name}</span>
-      <span style="font-family:'DM Mono',monospace;font-size:11px;color:var(--muted)">€${u.eff.toFixed(0)}</span>
-      <span style="font-family:'DM Mono',monospace;font-size:11px;color:var(--muted)">${euroAbs(spend[u.name]||0)}</span>
-      <span style="font-family:'DM Mono',monospace;font-size:12px;color:${u.delta>0?'var(--green)':'var(--red)'}">
-        ${u.delta>0?'+':''}${euroAbs(u.delta)}
-      </span>
+    <div style="display:grid;grid-template-columns:1fr 90px 90px 90px;gap:0;padding:6px 0;border-bottom:1px solid var(--border)">
+      <span style="color:var(--muted2);font-size:13px">${u.name}</span>
+      <span style="font-family:'DM Mono',monospace;font-size:12px;color:var(--muted);text-align:right">€${u.eff.toFixed(0)}</span>
+      <span style="font-family:'DM Mono',monospace;font-size:12px;color:var(--muted);text-align:right">${euroAbs(u.spent)}</span>
+      <span style="font-family:'DM Mono',monospace;font-size:12px;font-weight:500;text-align:right;color:${u.delta>0?'var(--green)':'var(--red)'}">${u.delta>0?'+':'−'}${euroAbs(Math.abs(u.delta))}</span>
     </div>`).join('')}
+    <div style="display:grid;grid-template-columns:1fr 90px 90px 90px;gap:0;padding:7px 0 2px;font-size:11px;color:var(--muted);font-family:'DM Mono',monospace">
+      <span></span><span></span><span></span>
+      <span style="text-align:right;color:var(--muted2)">→ ${MONTHS[nm-1].slice(0,3)} ${ny}</span>
+    </div>
   </div>`;
   acts.style.display='block';
 }
