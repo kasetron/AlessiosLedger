@@ -11,6 +11,7 @@ Personal finance tracker. Single-file Flask app with SQLite backend.
 - Spending trend alerts mid-month
 - Analysis tab: monthly spending, category comparison between two months and end-of-month balance, filterable by period, payment method and category (project spending kept separate)
 - Full backup and restore via JSON export
+- Monthly recurring transactions: pick "Ripeti → Ogni mese" in the transaction dialog; due occurrences are created automatically when the app is opened (days 29-31 fall on the last day of shorter months). Edit "this and following" or stop the series from the same dialog
 - Automatic daily snapshot of the database in `backups/` (last 14 kept; to restore, stop the app and copy a snapshot over `ledger.db`)
 
 ## Stack

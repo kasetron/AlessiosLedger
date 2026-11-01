@@ -4,7 +4,7 @@ Ledger — personal finance tracker
 Run: python ledger.py
 Open: http://localhost:5001
 """
-import sqlite3, os, re, json, uuid, webbrowser, threading
+import sqlite3, os, re, json, uuid, calendar, webbrowser, threading
 from datetime import date, datetime
 from flask import Flask, g, jsonify, request
 
@@ -50,7 +50,8 @@ def init_db():
         description TEXT    NOT NULL DEFAULT '',
         is_balance  INTEGER NOT NULL DEFAULT 0,
         project_id  INTEGER REFERENCES projects(id),
-        transfer_id TEXT
+        transfer_id TEXT,
+        recurrence_id INTEGER
     );
     CREATE TABLE IF NOT EXISTS categories (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -66,6 +67,17 @@ def init_db():
         amount    REAL    NOT NULL,
         PRIMARY KEY (year, month, category)
     );
+    CREATE TABLE IF NOT EXISTS recurrences (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        amount         REAL    NOT NULL,
+        method         TEXT    NOT NULL,
+        category       TEXT    NOT NULL DEFAULT '',
+        description    TEXT    NOT NULL DEFAULT '',
+        project_id     INTEGER REFERENCES projects(id),
+        day            INTEGER NOT NULL,
+        last_generated TEXT    NOT NULL,
+        active         INTEGER NOT NULL DEFAULT 1
+    );
     CREATE TABLE IF NOT EXISTS meta (
         key   TEXT PRIMARY KEY,
         value TEXT
@@ -78,6 +90,8 @@ def init_db():
         db.execute("ALTER TABLE transactions ADD COLUMN project_id INTEGER REFERENCES projects(id)")
     if 'transfer_id' not in cols:
         db.execute("ALTER TABLE transactions ADD COLUMN transfer_id TEXT")
+    if 'recurrence_id' not in cols:
+        db.execute("ALTER TABLE transactions ADD COLUMN recurrence_id INTEGER")
 
     # seed categories if empty
     if not db.execute("SELECT 1 FROM categories LIMIT 1").fetchone():
@@ -184,12 +198,64 @@ def auto_rollover_if_needed(db, year, month):
         return
     compute_rollover(db, year, month, skip_zero=True)
 
+# ── Ricorrenti ────────────────────────────────────────────────────────────────
+# Una ricorrenza (mensile) è un modello + `last_generated` (ultimo mese già creato). Le occorrenze
+# scadute (data <= oggi) vengono create all'apertura dei mesi. Cancellare un'occorrenza non la
+# ricrea, perché last_generated è già avanzato. I giorni 29-31 diventano l'ultimo giorno del mese.
+def clip_day(y, m, day):
+    return date(y, m, min(day, calendar.monthrange(y, m)[1]))
+
+def month_key(d):
+    return d.strftime("%Y-%m")
+
+def prev_month_key(d):
+    return f"{d.year-1}-12" if d.month == 1 else f"{d.year}-{d.month-1:02d}"
+
+def generate_recurrences(db, today=None):
+    today = today or date.today()
+    changed = False
+    for r in db.execute("SELECT * FROM recurrences WHERE active=1").fetchall():
+        y, m = map(int, r["last_generated"].split("-"))
+        last = r["last_generated"]
+        while True:
+            y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+            d = clip_day(y, m, r["day"])
+            if d > today:
+                break
+            db.execute(
+                "INSERT INTO transactions(amount,method,category,date,description,is_balance,project_id,recurrence_id) "
+                "VALUES(?,?,?,?,?,0,?,?)",
+                (r["amount"], r["method"], r["category"], d.isoformat(), r["description"], r["project_id"], r["id"]))
+            last = f"{y}-{m:02d}"
+        if last != r["last_generated"]:
+            db.execute("UPDATE recurrences SET last_generated=? WHERE id=?", (last, r["id"]))
+            changed = True
+    if changed:
+        db.commit()
+
+def make_recurrence(db, d, today=None):
+    """Crea la ricorrenza a partire da una transazione (dict con amount, method, category, date,
+    description, project_id) e ne restituisce l'id. Niente retroattività: se la data è nel passato
+    le occorrenze già trascorse non vengono ricreate, ci si limita a quelle future."""
+    today = today or date.today()
+    start = date.fromisoformat(d["date"])
+    if start >= today:
+        last = month_key(start)
+    else:
+        due_now = clip_day(today.year, today.month, start.day) <= today
+        last = max(month_key(today) if due_now else prev_month_key(today), month_key(start))
+    cur = db.execute(
+        "INSERT INTO recurrences(amount,method,category,description,project_id,day,last_generated) VALUES(?,?,?,?,?,?,?)",
+        (d["amount"], d["method"], d.get("category", ""), d.get("description", ""), d.get("project_id"), start.day, last))
+    return cur.lastrowid
+
 # ── API: Transactions ─────────────────────────────────────────────────────────
 @app.route("/api/txs")
 def get_txs():
     year  = request.args.get("year",  type=int)
     month = request.args.get("month", type=int)
     db = get_db()
+    generate_recurrences(db)
     if year and month:
         auto_rollover_if_needed(db, year, month)
         rows = db.execute(
@@ -204,10 +270,11 @@ def get_txs():
 def add_tx():
     d = request.json
     db = get_db()
+    rid = make_recurrence(db, d) if d.get("repeat") == "monthly" and not d.get("is_balance") else None
     cur = db.execute(
-        "INSERT INTO transactions(amount,method,category,date,description,is_balance,project_id) VALUES(?,?,?,?,?,?,?)",
+        "INSERT INTO transactions(amount,method,category,date,description,is_balance,project_id,recurrence_id) VALUES(?,?,?,?,?,?,?,?)",
         (d["amount"], d["method"], d.get("category",""), d["date"],
-         d.get("description",""), int(d.get("is_balance", False)), d.get("project_id"))
+         d.get("description",""), int(d.get("is_balance", False)), d.get("project_id"), rid)
     )
     db.commit()
     return jsonify(row_to_dict(db.execute("SELECT * FROM transactions WHERE id=?", (cur.lastrowid,)).fetchone())), 201
@@ -216,7 +283,7 @@ def add_tx():
 def update_tx(tid):
     d = request.json
     db = get_db()
-    row = db.execute("SELECT transfer_id FROM transactions WHERE id=?", (tid,)).fetchone()
+    row = db.execute("SELECT transfer_id, recurrence_id, date FROM transactions WHERE id=?", (tid,)).fetchone()
     if row and row["transfer_id"]:
         return jsonify({"error": "usa /api/transfers per modificare un trasferimento"}), 400
     db.execute(
@@ -224,6 +291,22 @@ def update_tx(tid):
         (d["amount"], d["method"], d.get("category",""), d["date"],
          d.get("description",""), int(d.get("is_balance", False)), d.get("project_id"), tid)
     )
+    # repeat: '' = solo questa · 'monthly' = rendila ricorrente · 'following' = questa e le prossime
+    #         della serie · 'stop' = interrompi la serie (le occorrenze già create restano)
+    mode, rid = d.get("repeat", ""), row["recurrence_id"] if row else None
+    if rid and mode == "following":
+        db.execute("UPDATE recurrences SET amount=?,method=?,category=?,description=?,project_id=?,day=? WHERE id=?",
+            (d["amount"], d["method"], d.get("category",""), d.get("description",""), d.get("project_id"),
+             int(d["date"][8:10]), rid))
+        for t in db.execute("SELECT id, date FROM transactions WHERE recurrence_id=? AND date>?", (rid, row["date"])).fetchall():
+            y, m = int(t["date"][:4]), int(t["date"][5:7])
+            db.execute("UPDATE transactions SET amount=?,method=?,category=?,description=?,project_id=?,date=? WHERE id=?",
+                (d["amount"], d["method"], d.get("category",""), d.get("description",""), d.get("project_id"),
+                 clip_day(y, m, int(d["date"][8:10])).isoformat(), t["id"]))
+    elif rid and mode == "stop":
+        db.execute("UPDATE recurrences SET active=0 WHERE id=?", (rid,))
+    elif not rid and mode == "monthly" and not d.get("is_balance"):
+        db.execute("UPDATE transactions SET recurrence_id=? WHERE id=?", (make_recurrence(db, d), tid))
     db.commit()
     return jsonify(row_to_dict(db.execute("SELECT * FROM transactions WHERE id=?", (tid,)).fetchone()))
 
@@ -238,6 +321,12 @@ def delete_tx_and_pair(db, tid):
 @app.route("/api/txs/<int:tid>", methods=["DELETE"])
 def delete_tx(tid):
     db = get_db()
+    if request.args.get("series") == "1":
+        # elimina anche le occorrenze successive e interrompe la serie
+        row = db.execute("SELECT recurrence_id, date FROM transactions WHERE id=?", (tid,)).fetchone()
+        if row and row["recurrence_id"]:
+            db.execute("DELETE FROM transactions WHERE recurrence_id=? AND date>?", (row["recurrence_id"], row["date"]))
+            db.execute("UPDATE recurrences SET active=0 WHERE id=?", (row["recurrence_id"],))
     delete_tx_and_pair(db, tid)
     db.commit()
     return jsonify({"ok": True})
@@ -402,6 +491,7 @@ def delete_project(pid):
     db = get_db()
     # unlink transactions before deleting
     db.execute("UPDATE transactions SET project_id=NULL WHERE project_id=?", (pid,))
+    db.execute("UPDATE recurrences SET project_id=NULL WHERE project_id=?", (pid,))
     db.execute("DELETE FROM projects WHERE id=?", (pid,))
     db.commit()
     return jsonify({"ok": True})
@@ -469,6 +559,7 @@ def backup():
         "cats":       rows_to_list(db.execute("SELECT * FROM categories ORDER BY sort_order").fetchall()),
         "carryovers": rows_to_list(db.execute("SELECT * FROM carryovers").fetchall()),
         "projects":   rows_to_list(db.execute("SELECT * FROM projects ORDER BY id").fetchall()),
+        "recurrences": rows_to_list(db.execute("SELECT * FROM recurrences ORDER BY id").fetchall()),
     })
 
 @app.route("/api/restore", methods=["POST"])
@@ -476,6 +567,7 @@ def restore():
     data = request.json
     db = get_db()
     db.execute("DELETE FROM transactions")
+    db.execute("DELETE FROM recurrences")
     db.execute("DELETE FROM categories")
     db.execute("DELETE FROM carryovers")
     db.execute("DELETE FROM projects")
@@ -486,9 +578,12 @@ def restore():
     for c in data.get("cats", []):
         db.execute("INSERT INTO categories(id,name,grp,threshold,sort_order) VALUES(?,?,?,?,?)",
             (c["id"],c["name"],c["grp"],c.get("threshold"),c.get("sort_order",99)))
+    for r in data.get("recurrences", []):
+        db.execute("INSERT INTO recurrences(id,amount,method,category,description,project_id,day,last_generated,active) VALUES(?,?,?,?,?,?,?,?,?)",
+            (r["id"],r["amount"],r["method"],r.get("category",""),r.get("description",""),r.get("project_id"),r["day"],r["last_generated"],r.get("active",1)))
     for t in data.get("txs", []):
-        db.execute("INSERT INTO transactions(id,amount,method,category,date,description,is_balance,project_id,transfer_id) VALUES(?,?,?,?,?,?,?,?,?)",
-            (t["id"],t["amount"],t["method"],t.get("category",""),t["date"],t.get("description",""),int(t.get("is_balance",0)),t.get("project_id"),t.get("transfer_id")))
+        db.execute("INSERT INTO transactions(id,amount,method,category,date,description,is_balance,project_id,transfer_id,recurrence_id) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (t["id"],t["amount"],t["method"],t.get("category",""),t["date"],t.get("description",""),int(t.get("is_balance",0)),t.get("project_id"),t.get("transfer_id"),t.get("recurrence_id")))
     for co in data.get("carryovers", []):
         db.execute("INSERT INTO carryovers(year,month,category,amount) VALUES(?,?,?,?)",
             (co["year"],co["month"],co["category"],co["amount"]))
@@ -649,6 +744,7 @@ input[type=checkbox]:checked::after{content:'✓';position:absolute;top:50%;left
 .field{margin-bottom:13px}
 .field label{display:block;font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);font-family:'DM Mono',monospace;margin-bottom:6px}
 .field input[type=text],.field input[type=number],.field input[type=date]{width:100%;background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:10px 12px;border-radius:8px;font-size:14px;font-family:'DM Sans',sans-serif;outline:none;transition:border-color .15s}
+.field-row{display:flex;gap:10px}.field-row .field{flex:1;min-width:0}
 .field input:focus{border-color:var(--gold)}.field input::placeholder{color:var(--muted)}
 .sign-row{display:flex;gap:8px}
 .sign-btns{display:flex;background:var(--surface2);border:1px solid var(--border);border-radius:8px;overflow:hidden}
@@ -932,7 +1028,10 @@ input[type=checkbox]:checked::after{content:'✓';position:absolute;top:50%;left
     <div class="field" id="field-cat"><label>Categoria / Progetto</label><div id="csel-fcat-m"></div></div>
     <div class="field"><label id="lbl-method">Metodo di pagamento</label><div id="csel-fmethod-m"></div></div>
     <div class="field" id="field-to" style="display:none"><label>A</label><div id="csel-fmethod-to"></div></div>
-    <div class="field"><label>Data</label><input type="date" id="f-date"></div>
+    <div class="field-row">
+      <div class="field"><label>Data</label><input type="date" id="f-date"></div>
+      <div class="field" id="field-repeat"><label id="lbl-repeat">Ripeti</label><div id="csel-repeat"></div></div>
+    </div>
     <div class="toggle-row" id="row-isbal">
       <label class="toggle"><input type="checkbox" id="f-isbal"><span class="toggle-slider"></span></label>
       <span class="toggle-label" onclick="document.getElementById('f-isbal').click()">Saldo iniziale / riporto — escluso dal riepilogo</span>
@@ -1067,7 +1166,7 @@ class CSMix extends CS {
   }
 }
 
-let sFC, sFM, sFT, sNG, sMFC, sMFM, sMTo, sAM, sAC, sAA, sAB;
+let sFC, sFM, sFT, sNG, sMFC, sMFM, sMTo, sRep, sAM, sAC, sAA, sAB;
 
 function buildCatModalOpts(keepProjId=null) {
   // progetti attivi + (in modifica) quello già assegnato, anche se archiviato
@@ -1104,6 +1203,7 @@ function initSelects() {
     sMFC = new CSMix('csel-fcat-m', buildCatModalOpts(), {cat:'',proj:null}, (v,catChanged)=>{if(catChanged&&v.cat==='guadagni')setSign(1);});
     sMFM = new CS('csel-fmethod-m', METHODS.map(m=>({value:m,label:m})), 'Conto', null);
     sMTo = new CS('csel-fmethod-to', METHODS.map(m=>({value:m,label:m})), 'Contanti', null);
+    sRep = new CS('csel-repeat', [{value:'none',label:'Mai'},{value:'monthly',label:'Ogni mese'}], 'none', null);
     sAM  = new CS('csel-amethod', [{value:'',label:'Tutti i metodi'},...METHODS.map(m=>({value:m,label:m}))], '', v=>{AN.method=v;renderAnalysis();}, true);
     sAC  = new CS('csel-acat', [{value:'',label:'Tutte le categorie'}], '', v=>{AN.cat=v;renderAnalysis();}, true);
     sAA  = new CS('csel-aa', [], '', v=>{AN.a=v;renderAnalysis();}, true);
@@ -1348,7 +1448,7 @@ function renderTxTable() {
         <input type="checkbox" ${sel?'checked':''} onchange="toggleSel(${t.id},this.checked)">
       </td>
       <td><span class="tx-date">${ds}</span></td>
-      <td>${esc(t.description)||'—'}${t.is_balance?'<span style="font-size:10px;color:var(--muted);margin-left:6px">↩</span>':''}</td>
+      <td>${esc(t.description)||'—'}${t.recurrence_id?'<span title="Ricorrente" style="font-size:11px;color:var(--muted);margin-left:6px">↻</span>':''}${t.is_balance?'<span style="font-size:10px;color:var(--muted);margin-left:6px">↩</span>':''}</td>
       <td class="hide-sm">${txCatLabel(t)}</td>
       <td class="hide-sm">${t.isTransfer?`<span class="pill pill-${t.from}">${t.from}</span> → <span class="pill pill-${t.to}">${t.to}</span>`:`<span class="pill pill-${t.method}">${t.method}</span>`}</td>
       <td><span class="tx-amt ${amtCls}">${t.isTransfer?euroAbs(t.amount):euroSgn(t.amount)}</span></td>
@@ -1572,6 +1672,12 @@ async function deleteProject(id) {
 function openModal(id=null) {
   editId=id; editTid=null;
   sMFC.setOpts(buildCatModalOpts(STATE.txs.find(t=>t.id===id)?.project_id??null), false);
+  // "Ripeti": nuova/normale → Mai | Ogni mese · già ricorrente → a cosa applicare la modifica
+  const recurring=!!STATE.txs.find(t=>t.id===id)?.recurrence_id;
+  document.getElementById('lbl-repeat').textContent=recurring?'Serie ricorrente':'Ripeti';
+  sRep.setOpts(recurring
+    ?[{value:'none',label:'Solo questa'},{value:'following',label:'Questa e le prossime'},{value:'stop',label:'Interrompi la serie'}]
+    :[{value:'none',label:'Mai'},{value:'monthly',label:'Ogni mese'}], false);
 
   if (id) {
     const tx=STATE.txs.find(t=>t.id===id); if(!tx)return;
@@ -1620,7 +1726,13 @@ function setSign(s){
   document.getElementById('row-isbal').style.display=x?'none':'';
   document.getElementById('field-to').style.display=x?'':'none';
   document.getElementById('lbl-method').textContent=x?'Da':'Metodo di pagamento';
+  syncRepeat();
 }
+// la ricorrenza non si applica a trasferimenti né a saldi iniziali
+function syncRepeat(){
+  document.getElementById('field-repeat').style.display=(sign===0||document.getElementById('f-isbal').checked)?'none':'';
+}
+document.getElementById('f-isbal').addEventListener('change',syncRepeat);
 
 async function saveTx() {
   const raw=parseFloat(document.getElementById('f-amount').value);
@@ -1639,11 +1751,14 @@ async function saveTx() {
 
   // categoria e progetto (entrambi opzionali) dal menu unificato
   const {cat:category, proj:project_id} = sMFC.value;
+  const repeat=sRep.value==='none'?'':sRep.value;
+  if(repeat==='following'&&!confirm('Applicare la modifica a questa e a tutte le prossime occorrenze?')) return;
+  if(repeat==='stop'&&!confirm('Interrompere la serie? Le occorrenze già create restano.')) return;
 
   const payload={
     amount:sign*raw,
     description:document.getElementById('f-desc').value.trim(),
-    category, project_id,
+    category, project_id, repeat,
     method:sMFM.value,
     date,
     is_balance:document.getElementById('f-isbal').checked
@@ -1656,7 +1771,11 @@ async function saveTx() {
 async function deleteTx() {
   if(!editId||!confirm('Eliminare questa transazione?'))return;
   if(editTid) await api(`/api/transfers/${editTid}`,{method:'DELETE'});
-  else        await api(`/api/txs/${editId}`,{method:'DELETE'});
+  else {
+    const tx=STATE.txs.find(t=>t.id===editId);
+    const series=!!tx?.recurrence_id&&confirm('Questa transazione è ricorrente.\n\nOK = elimina anche le prossime occorrenze e interrompi la serie\nAnnulla = elimina solo questa');
+    await api(`/api/txs/${editId}${series?'?series=1':''}`,{method:'DELETE'});
+  }
   closeModal(); await render();
 }
 
@@ -1717,7 +1836,7 @@ async function importBackup(e) {
     if(!data.txs||!data.cats)throw 0;
     if(!confirm(`Importare ${data.txs.length} transazioni? I dati attuali saranno sovrascritti.`))return;
     await api('/api/restore',{method:'POST',body:data});
-    sFC=sFM=sFT=sNG=sMFC=sMFM=sMTo=sAM=sAC=sAA=sAB=null;
+    sFC=sFM=sFT=sNG=sMFC=sMFM=sMTo=sRep=sAM=sAC=sAA=sAB=null;
     showToast('Backup ripristinato');
     await render();
   } catch{alert('File non valido');}
