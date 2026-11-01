@@ -2,7 +2,7 @@
 """
 Ledger — personal finance tracker
 Run: python ledger.py
-Open: http://localhost:5000
+Open: http://localhost:5001
 """
 import sqlite3, os, json, webbrowser, threading
 from datetime import date, datetime
@@ -98,10 +98,8 @@ def row_to_dict(row): return dict(row) if row else None
 def rows_to_list(rows): return [dict(r) for r in rows]
 
 # ── Auto rollover ─────────────────────────────────────────────────────────────
-def auto_rollover_if_needed(db, year, month):
-    key = f"rollover_done_{year}_{month:02d}"
-    if db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone():
-        return
+def compute_rollover(db, year, month, skip_zero):
+    """Scrive in `carryovers` il riporto di (year, month) calcolato dal mese precedente."""
     prev_m, prev_y = (month-1, year) if month > 1 else (12, year-1)
     rows = db.execute(
         "SELECT category, SUM(amount) as s FROM transactions "
@@ -120,13 +118,29 @@ def auto_rollover_if_needed(db, year, month):
         ).fetchone()
         eff = c["threshold"] + (prev_co["amount"] if prev_co else 0.0)
         unused = round(eff + net.get(c["name"], 0.0), 2)
-        if abs(unused) > 0.01:
-            db.execute(
-                "INSERT OR REPLACE INTO carryovers(year,month,category,amount) VALUES(?,?,?,?)",
-                (year, month, c["name"], unused)
-            )
-    db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, "1"))
+        if skip_zero and abs(unused) <= 0.01:
+            continue
+        db.execute(
+            "INSERT OR REPLACE INTO carryovers(year,month,category,amount) VALUES(?,?,?,?)",
+            (year, month, c["name"], unused)
+        )
+    db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (f"rollover_done_{year}_{month:02d}", "1"))
     db.commit()
+
+def auto_rollover_if_needed(db, year, month):
+    key = f"rollover_done_{year}_{month:02d}"
+    if db.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone():
+        return
+    prev_m, prev_y = (month-1, year) if month > 1 else (12, year-1)
+    # Se il mese precedente è vuoto non c'è nulla da riportare: senza questo controllo
+    # sfogliare un mese futuro/primo mese raddoppia i budget e "congela" il riporto.
+    has_prev = db.execute(
+        "SELECT 1 FROM transactions WHERE strftime('%Y',date)=? AND strftime('%m',date)=? LIMIT 1",
+        (str(prev_y), f"{prev_m:02d}")
+    ).fetchone()
+    if not has_prev:
+        return
+    compute_rollover(db, year, month, skip_zero=True)
 
 # ── API: Transactions ─────────────────────────────────────────────────────────
 @app.route("/api/txs")
@@ -241,32 +255,8 @@ def get_carryovers():
 def force_rollover():
     d = request.json
     year, month = d["year"], d["month"]
-    prev_m, prev_y = (month-1, year) if month > 1 else (12, year-1)
     db = get_db()
-    rows = db.execute(
-        "SELECT category, SUM(amount) as s FROM transactions "
-        "WHERE strftime('%Y',date)=? AND strftime('%m',date)=? "
-        "AND is_balance=0 AND category!='' AND method!='Risparmio' "
-        "AND project_id IS NULL "
-        "GROUP BY category",
-        (str(prev_y), f"{prev_m:02d}")
-    ).fetchall()
-    net = {r["category"]: r["s"] for r in rows}
-    cats = db.execute("SELECT name, threshold FROM categories WHERE threshold IS NOT NULL").fetchall()
-    for c in cats:
-        prev_co = db.execute(
-            "SELECT amount FROM carryovers WHERE year=? AND month=? AND category=?",
-            (prev_y, prev_m, c["name"])
-        ).fetchone()
-        eff = c["threshold"] + (prev_co["amount"] if prev_co else 0.0)
-        unused = round(eff + net.get(c["name"], 0.0), 2)
-        db.execute(
-            "INSERT OR REPLACE INTO carryovers(year,month,category,amount) VALUES(?,?,?,?)",
-            (year, month, c["name"], unused)
-        )
-    key = f"rollover_done_{year}_{month:02d}"
-    db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (key, "1"))
-    db.commit()
+    compute_rollover(db, year, month, skip_zero=False)
     return jsonify(rows_to_list(db.execute("SELECT * FROM carryovers WHERE year=? AND month=?", (year, month)).fetchall()))
 
 # ── API: Projects ─────────────────────────────────────────────────────────────
@@ -314,15 +304,16 @@ def delete_project(pid):
 @app.route("/api/projects/<int:pid>/spending")
 def project_spending(pid):
     db = get_db()
+    # Spesa NETTA: i rimborsi/entrate del progetto (amount>0) riducono il totale speso.
     row = db.execute(
-        "SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE project_id=? AND amount<0",
+        "SELECT COALESCE(SUM(amount),0) as total FROM transactions WHERE project_id=? AND is_balance=0",
         (pid,)
     ).fetchone()
     txs = db.execute(
-        "SELECT * FROM transactions WHERE project_id=? ORDER BY date DESC",
+        "SELECT * FROM transactions WHERE project_id=? ORDER BY date DESC, id DESC",
         (pid,)
     ).fetchall()
-    return jsonify({"spent": abs(row["total"]), "transactions": rows_to_list(txs)})
+    return jsonify({"spent": round(-row["total"], 2), "transactions": rows_to_list(txs)})
 
 # ── Backup / Restore ──────────────────────────────────────────────────────────
 @app.route("/api/backup")
@@ -356,6 +347,10 @@ def restore():
     for co in data.get("carryovers", []):
         db.execute("INSERT INTO carryovers(year,month,category,amount) VALUES(?,?,?,?)",
             (co["year"],co["month"],co["category"],co["amount"]))
+        # il backup non contiene `meta`: segna i mesi già riportati, altrimenti
+        # l'auto-rollover li ricalcolerebbe sovrascrivendo i riporti ripristinati
+        db.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+            (f"rollover_done_{co['year']}_{co['month']:02d}", "1"))
     db.commit()
     return jsonify({"ok": True})
 
@@ -823,8 +818,9 @@ class CS {
 
 let sFC, sFM, sFT, sNG, sMFC, sMFM;
 
-function buildCatModalOpts() {
-  const activeProjects = STATE.projects.filter(p=>!p.archived);
+function buildCatModalOpts(keepProjId=null) {
+  // progetti attivi + (in modifica) quello già assegnato, anche se archiviato
+  const activeProjects = STATE.projects.filter(p=>!p.archived||p.id===keepProjId);
   const opts = [
     {value:'', label:'— nessuna —'},
     {header:'CATEGORIE'},
@@ -903,6 +899,21 @@ function renderBalances() {
     </div>`;
 }
 
+// Spesa netta per categoria del mese corrente (rimborsi in categoria sottraggono),
+// coerente con il calcolo del riporto. Esclude saldi, Risparmio e transazioni di progetto.
+function catSpend() {
+  const spend={};
+  STATE.txs.filter(t=>!t.is_balance&&t.category&&t.method!=='Risparmio'&&!t.project_id).forEach(t=>{
+    spend[t.category]=(spend[t.category]||0)-t.amount;
+  });
+  return spend;
+}
+
+// Escape per tutto ciò che è testo utente inserito via innerHTML
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+// "YYYY-MM-DD" → "DD/MM[/YYYY]" senza passare da Date (niente slittamenti di fuso)
+const fmtDate=(s,withYear=false)=>{const [y,m,d]=s.split('-');return `${d}/${m}${withYear?'/'+y:''}`;};
+
 // ── Overview ──
 function renderOverview() {
   const real=STATE.txs.filter(t=>!t.is_balance);
@@ -918,10 +929,7 @@ function renderOverview() {
 
   renderTrend();
 
-  const spend={};
-  real.filter(t=>t.category&&t.amount<0&&t.method!=='Risparmio'&&!t.project_id).forEach(t=>{
-    spend[t.category]=(spend[t.category]||0)+Math.abs(t.amount);
-  });
+  const spend=catSpend();
   const co=STATE.coMap;
   const visible=STATE.cats.filter(c=>c.threshold||(spend[c.name]>0));
   if (!visible.length) {
@@ -940,7 +948,7 @@ function renderOverview() {
       const coNote=co[c.name]>0?`<span style="color:var(--amber);font-size:10px"> +${co[c.name].toFixed(0)}</span>`
                   :co[c.name]<0?`<span style="color:var(--red);font-size:10px"> ${co[c.name].toFixed(0)}</span>`:'';
       return `<div class="cat-row">
-        <div class="cat-name">${c.name}</div>
+        <div class="cat-name">${esc(c.name)}</div>
         <div class="bar-track"><div class="bar-fill ${cls}" style="width:${pct.toFixed(1)}%"></div></div>
         <div class="cat-amount">${euroAbs(val)}</div>
         <div class="cat-limit">${eff!=null?'/ €'+eff.toFixed(0)+coNote:''}</div>
@@ -966,7 +974,7 @@ function renderOverview() {
     ?'<div style="color:var(--green);font-size:13px;padding:6px 0">✓ Nessuna soglia superata</div>'
     :[...over,...warn].map(c=>{
         const val=spend[c.name]||0, eff=c.threshold+(co[c.name]||0), isO=val>eff;
-        return `<div class="alert-row"><span>${c.name}</span>
+        return `<div class="alert-row"><span>${esc(c.name)}</span>
           <div style="display:flex;gap:8px;align-items:center">
             <span style="font-family:'DM Mono',monospace;font-size:12px;color:var(--muted2)">${euroAbs(val)} / €${eff.toFixed(0)}</span>
             <span class="badge ${isO?'over':'warn'}">${isO?'SFORATO':'ATTENZIONE'}</span>
@@ -981,10 +989,7 @@ function renderTrend() {
   const elapsed=isCur?today.getDate():dim;
   const tf=elapsed/dim;
   const co=STATE.coMap;
-  const spend={};
-  STATE.txs.filter(t=>!t.is_balance&&t.category&&t.amount<0&&t.method!=='Risparmio'&&!t.project_id).forEach(t=>{
-    spend[t.category]=(spend[t.category]||0)+Math.abs(t.amount);
-  });
+  const spend=catSpend();
   const alerts=STATE.cats.filter(c=>c.threshold&&spend[c.name]).map(c=>{
     const eff=c.threshold+(co[c.name]||0), val=spend[c.name]||0;
     const pace=(val/eff)/Math.max(tf,.01);
@@ -997,7 +1002,7 @@ function renderTrend() {
     ${alerts.map(a=>{
       const proj=(a.val/elapsed)*dim;
       return `<div class="trend-row">
-        <span>${a.level==='danger'?'🔴':'🟡'} <strong>${a.name}</strong></span>
+        <span>${a.level==='danger'?'🔴':'🟡'} <strong>${esc(a.name)}</strong></span>
         <div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">
           <span class="trend-stat">ritmo ${(a.pace*100).toFixed(0)}% — proiezione ${euroAbs(proj)} / €${a.eff.toFixed(0)}</span>
           <span class="badge ${a.level==='danger'?'over':'warn'}">${a.level==='danger'?'ACCELERA':'ATTENZIONE'}</span>
@@ -1009,16 +1014,16 @@ function renderTrend() {
 function txCatLabel(t) {
   if (t.project_id) {
     const p=STATE.projects.find(p=>p.id===t.project_id);
-    return p ? `<span class="pill pill-project">▸ ${p.name}</span>` : `<span class="pill pill-project">progetto #${t.project_id}</span>`;
+    return p ? `<span class="pill pill-project">▸ ${esc(p.name)}</span>` : `<span class="pill pill-project">progetto #${t.project_id}</span>`;
   }
-  return t.category ? `<span class="pill">${t.category}</span>` : '<span style="color:var(--muted)">—</span>';
+  return t.category ? `<span class="pill">${esc(t.category)}</span>` : '<span style="color:var(--muted)">—</span>';
 }
 
-function renderTxTable() {
+function visibleTxs() {
   const search=(document.getElementById('search-input')?.value||'').toLowerCase();
   const catF=sFC?.value||'', methF=sFM?.value||'', typeF=sFT?.value||'';
 
-  let rows=STATE.txs.filter(t=>{
+  return STATE.txs.filter(t=>{
     if(search&&!t.description.toLowerCase().includes(search)
       &&!(t.category||'').toLowerCase().includes(search)
       &&!(STATE.projects.find(p=>p.id===t.project_id)?.name||'').toLowerCase().includes(search)) return false;
@@ -1032,6 +1037,10 @@ function renderTxTable() {
     if(typeF==='bal'&&!t.is_balance) return false;
     return true;
   });
+}
+
+function renderTxTable() {
+  let rows=visibleTxs();
 
   rows=[...rows].sort((a,b)=>{
     let va=a[sortCol],vb=b[sortCol];
@@ -1049,8 +1058,7 @@ function renderTxTable() {
   const tbody=document.getElementById('tx-body');
   if(!rows.length){tbody.innerHTML='<tr><td colspan="6"><div class="empty-state">Nessuna transazione trovata</div></td></tr>';return;}
   tbody.innerHTML=rows.map(t=>{
-    const d=new Date(t.date);
-    const ds=d.getDate().toString().padStart(2,'0')+'/'+(d.getMonth()+1).toString().padStart(2,'0');
+    const ds=fmtDate(t.date);
     const amtCls=t.is_balance?'amt-neu':t.amount>=0?'amt-pos':'amt-neg';
     const sel=selectedIds.has(t.id);
     return `<tr class="${t.is_balance?'tx-balance':''} ${sel?'tx-selected':''}" onclick="rowClick(event,${t.id})">
@@ -1058,7 +1066,7 @@ function renderTxTable() {
         <input type="checkbox" ${sel?'checked':''} onchange="toggleSel(${t.id},this.checked)">
       </td>
       <td><span class="tx-date">${ds}</span></td>
-      <td>${t.description||'—'}${t.is_balance?'<span style="font-size:10px;color:var(--muted);margin-left:6px">↩</span>':''}</td>
+      <td>${esc(t.description)||'—'}${t.is_balance?'<span style="font-size:10px;color:var(--muted);margin-left:6px">↩</span>':''}</td>
       <td class="hide-sm">${txCatLabel(t)}</td>
       <td class="hide-sm"><span class="pill pill-${t.method}">${t.method}</span></td>
       <td><span class="tx-amt ${amtCls}">${euroSgn(t.amount)}</span></td>
@@ -1075,7 +1083,7 @@ function sortBy(col) {
 }
 function rowClick(e,id){if(e.target.type!=='checkbox')openModal(id);}
 function toggleSel(id,on){on?selectedIds.add(id):selectedIds.delete(id);renderTxTable();}
-function toggleAll(cb){STATE.txs.forEach(t=>cb.checked?selectedIds.add(t.id):selectedIds.delete(t.id));renderTxTable();}
+function toggleAll(cb){visibleTxs().forEach(t=>cb.checked?selectedIds.add(t.id):selectedIds.delete(t.id));renderTxTable();}
 async function bulkDelete(){
   if(!selectedIds.size||!confirm(`Eliminare ${selectedIds.size} transazioni?`))return;
   await api('/api/txs/bulk-delete',{method:'POST',body:{ids:[...selectedIds]}});
@@ -1084,10 +1092,7 @@ async function bulkDelete(){
 
 // ── Cat list ──
 function renderCatList() {
-  const spend={};
-  STATE.txs.filter(t=>!t.is_balance&&t.category&&t.amount<0).forEach(t=>{
-    spend[t.category]=(spend[t.category]||0)+Math.abs(t.amount);
-  });
+  const spend=catSpend();
   const co=STATE.coMap;
   document.getElementById('cat-list').innerHTML=['NECESSARIE','AGGIUNTIVE'].map(g=>{
     return `<div class="group-label">${g}</div>`+
@@ -1095,8 +1100,8 @@ function renderCatList() {
         const hint=co[c.name]>0?` <span style="color:var(--amber);font-size:10px">(+${co[c.name].toFixed(0)} riportato)</span>`
                   :co[c.name]<0?` <span style="color:var(--red);font-size:10px">(${co[c.name].toFixed(0)} malus)</span>`:'';
         return `<div class="cat-edit-row">
-          <div class="cat-edit-name">${c.name}${hint}</div>
-          <div class="cat-spent-lbl">${spend[c.name]?euroAbs(spend[c.name]):''}</div>
+          <div class="cat-edit-name">${esc(c.name)}${hint}</div>
+          <div class="cat-spent-lbl">${spend[c.name]>0?euroAbs(spend[c.name]):''}</div>
           <input class="threshold-input" type="number" min="0" step="1"
             placeholder="soglia €" value="${c.threshold!=null?c.threshold:''}"
             onchange="updateThreshold(${c.id},this.value)">
@@ -1138,7 +1143,7 @@ async function calcRollover() {
     </div>
     ${items.map(u=>`
     <div style="display:grid;grid-template-columns:1fr 90px 90px 90px;gap:0;padding:6px 0;border-bottom:1px solid var(--border)">
-      <span style="color:var(--muted2);font-size:13px">${u.name}</span>
+      <span style="color:var(--muted2);font-size:13px">${esc(u.name)}</span>
       <span style="font-family:'DM Mono',monospace;font-size:12px;color:var(--muted);text-align:right">€${u.eff.toFixed(0)}</span>
       <span style="font-family:'DM Mono',monospace;font-size:12px;color:var(--muted);text-align:right">${euroAbs(u.spent)}</span>
       <span style="font-family:'DM Mono',monospace;font-size:12px;font-weight:500;text-align:right;color:${u.delta>0?'var(--green)':'var(--red)'}">${u.delta>0?'+':'−'}${euroAbs(Math.abs(u.delta))}</span>
@@ -1174,29 +1179,29 @@ async function renderProjects() {
     const spending = await Promise.all(active.map(p=>api(`/api/projects/${p.id}/spending`)));
     el.innerHTML = active.map((p,i)=>{
       const s=spending[i];
-      const pct=p.total_budget?Math.min(s.spent/p.total_budget*100,100):null;
+      const rawPct=p.total_budget?s.spent/p.total_budget*100:0;  // non clampato: serve per soglie warn/over
+      const pct=Math.max(0,Math.min(rawPct,100));
       const rem=p.total_budget!=null?p.total_budget-s.spent:null;
-      const cls=pct>100?'over':pct>80?'warn':'';
+      const cls=rawPct>100?'over':rawPct>80?'warn':'';
       const txHtml=s.transactions.map(t=>{
-        const d=new Date(t.date);
-        const ds=d.getDate().toString().padStart(2,'0')+'/'+(d.getMonth()+1).toString().padStart(2,'0')+'/'+d.getFullYear();
+        const ds=fmtDate(t.date,true);
         return `<div class="proj-tx-item">
           <span class="proj-tx-date">${ds}</span>
-          <span class="proj-tx-desc">${t.description||'—'}</span>
-          <span class="proj-tx-amt">${euroSgn(t.amount)}</span>
+          <span class="proj-tx-desc">${esc(t.description)||'—'}</span>
+          <span class="proj-tx-amt" style="color:${t.is_balance?'var(--muted)':t.amount>=0?'var(--green)':'var(--red)'}">${euroSgn(t.amount)}</span>
         </div>`;
       }).join('')||'<div style="color:var(--muted);font-size:12px;padding:6px 0">Nessuna spesa ancora — seleziona questo progetto quando aggiungi una transazione</div>';
 
       return `<div class="proj-card">
         <div class="proj-header">
           <div>
-            <div class="proj-name">${p.name}</div>
-            ${p.description?`<div class="proj-desc">${p.description}</div>`:''}
+            <div class="proj-name">${esc(p.name)}</div>
+            ${p.description?`<div class="proj-desc">${esc(p.description)}</div>`:''}
             <div class="proj-meta">creato il ${p.created_at} · ${s.transactions.length} transazioni</div>
           </div>
           <div class="proj-actions">
-            <button class="btn-secondary btn-sm" onclick="archiveProject(${p.id},${p.archived},'${p.name.replace(/'/g,"\\'")}',${p.total_budget||'null'},'${p.description.replace(/'/g,"\\'")}')">Archivia</button>
-            <button class="btn-danger btn-sm" onclick="deleteProject(${p.id},'${p.name.replace(/'/g,"\\'")}')">Elimina</button>
+            <button class="btn-secondary btn-sm" onclick="archiveProject(${p.id})">Archivia</button>
+            <button class="btn-danger btn-sm" onclick="deleteProject(${p.id})">Elimina</button>
           </div>
         </div>
         <div class="proj-stats">
@@ -1211,7 +1216,7 @@ async function renderProjects() {
             ${rem>=0
               ?`<span style="color:var(--green)">rimangono ${euroAbs(rem)}</span>`
               :`<span style="color:var(--red)">sforato di ${euroAbs(Math.abs(rem))}</span>`}
-            <span>budget €${p.total_budget}</span>
+            <span>budget ${euroAbs(p.total_budget)}</span>
           </div>`
           :`<div style="font-family:'DM Mono',monospace;font-size:12px;color:var(--muted2)">speso ${euroAbs(s.spent)} — nessun limite impostato</div>`}
         </div>
@@ -1225,10 +1230,10 @@ async function renderProjects() {
     arcEl.innerHTML=archived.map(p=>`
       <div class="proj-card archived">
         <div class="proj-header">
-          <div><div class="proj-name">${p.name}</div>${p.description?`<div class="proj-desc">${p.description}</div>`:''}</div>
+          <div><div class="proj-name">${esc(p.name)}</div>${p.description?`<div class="proj-desc">${esc(p.description)}</div>`:''}</div>
           <div class="proj-actions">
-            <button class="btn-secondary btn-sm" onclick="archiveProject(${p.id},${p.archived},'${p.name.replace(/'/g,"\\'")}',${p.total_budget||'null'},'${p.description.replace(/'/g,"\\'")}')">Ripristina</button>
-            <button class="btn-danger btn-sm" onclick="deleteProject(${p.id},'${p.name.replace(/'/g,"\\'")}')">Elimina</button>
+            <button class="btn-secondary btn-sm" onclick="archiveProject(${p.id})">Ripristina</button>
+            <button class="btn-danger btn-sm" onclick="deleteProject(${p.id})">Elimina</button>
           </div>
         </div>
       </div>`).join('');
@@ -1260,18 +1265,21 @@ async function addProject() {
   await render();
 }
 
-async function archiveProject(id, currentArchived, name, budget, desc) {
-  const newArchived = currentArchived ? 0 : 1;
+async function archiveProject(id) {
+  const p = STATE.projects.find(p=>p.id===id); if (!p) return;
+  const newArchived = p.archived ? 0 : 1;
   const action = newArchived ? 'archiviare' : 'ripristinare';
-  if (!confirm(`Vuoi ${action} il progetto "${name}"?`)) return;
+  if (!confirm(`Vuoi ${action} il progetto "${p.name}"?`)) return;
   await api(`/api/projects/${id}`, {method:'PUT', body:{
-    name, total_budget:budget, description:desc, archived:newArchived
+    name:p.name, total_budget:p.total_budget, description:p.description, archived:newArchived
   }});
-  showToast(newArchived ? `"${name}" archiviato` : `"${name}" ripristinato`);
+  showToast(newArchived ? `"${p.name}" archiviato` : `"${p.name}" ripristinato`);
   await render();
 }
 
-async function deleteProject(id, name) {
+async function deleteProject(id) {
+  const p = STATE.projects.find(p=>p.id===id); if (!p) return;
+  const name = p.name;
   if (!confirm(`Eliminare definitivamente il progetto "${name}"?\nLe transazioni collegate rimarranno ma non saranno più associate al progetto.`)) return;
   await api(`/api/projects/${id}`, {method:'DELETE'});
   showToast(`"${name}" eliminato`);
@@ -1281,7 +1289,7 @@ async function deleteProject(id, name) {
 // ── Modal ──
 function openModal(id=null) {
   editId=id;
-  sMFC.setOpts(buildCatModalOpts(), false);
+  sMFC.setOpts(buildCatModalOpts(STATE.txs.find(t=>t.id===id)?.project_id??null), false);
 
   if (id) {
     const tx=STATE.txs.find(t=>t.id===id); if(!tx)return;
@@ -1443,10 +1451,11 @@ def index():
 
 if __name__ == "__main__":
     init_db()
-    port = int(os.environ.get("PORT", 5000))
+    port = int(os.environ.get("PORT", 5001))
+    host = os.environ.get("HOST", "127.0.0.1")  # solo locale: nessuna autenticazione
     url  = f"http://localhost:{port}"
     print(f"\n  ╔═════════════════════════════════════╗")
     print(f"  ║   Ledger  →  {url}  ║")
     print(f"  ╚═════════════════════════════════════╝\n")
     threading.Timer(0.6, lambda: webbrowser.open(url)).start()
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host=host, port=port, debug=False)
