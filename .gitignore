@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 ledger.db-wal
 ledger.db-shm
+backups/

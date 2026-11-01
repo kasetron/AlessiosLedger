@@ -10,6 +10,7 @@ Personal finance tracker. Single-file Flask app with SQLite backend.
 - Project budgets — fixed budgets for non-recurring expenses (e.g. travel costs) tracked across months
 - Spending trend alerts mid-month
 - Full backup and restore via JSON export
+- Automatic daily snapshot of the database in `backups/` (last 14 kept; to restore, stop the app and copy a snapshot over `ledger.db`)
 
 ## Stack
 

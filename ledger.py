@@ -10,6 +10,8 @@ from flask import Flask, g, jsonify, request
 
 app = Flask(__name__)
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ledger.db")
+BACKUP_DIR = os.path.join(os.path.dirname(DB), "backups")
+BACKUP_KEEP = 14
 METHODS = ("Conto", "Paypal", "Contanti", "Libretto", "Risparmio")
 
 # ── DB ────────────────────────────────────────────────────────────────────────
@@ -96,6 +98,42 @@ def init_db():
         db.executemany("INSERT INTO categories(name,grp,threshold,sort_order) VALUES(?,?,?,?)", cats)
     db.commit()
     db.close()
+
+# ── Backup automatico ─────────────────────────────────────────────────────────
+_last_backup_day = None
+
+def daily_backup():
+    """Una copia consistente del DB al giorno in backups/, tenendo le ultime BACKUP_KEEP.
+    Usa VACUUM INTO (snapshot corretto anche con il WAL), non una semplice copia del file."""
+    global _last_backup_day
+    today = date.today().isoformat()
+    if _last_backup_day == today:
+        return
+    _last_backup_day = today
+    try:
+        if not os.path.exists(DB):
+            return
+        os.makedirs(BACKUP_DIR, exist_ok=True)
+        dest = os.path.join(BACKUP_DIR, f"ledger-{today}.db")
+        if not os.path.exists(dest):
+            tmp = dest + ".tmp"
+            if os.path.exists(tmp):
+                os.remove(tmp)
+            src = sqlite3.connect(DB)
+            try:
+                src.execute("VACUUM INTO ?", (tmp,))  # snapshot coerente in un solo file
+            finally:
+                src.close()
+            os.replace(tmp, dest)  # il file finale compare solo a copia completata
+        names = sorted(n for n in os.listdir(BACKUP_DIR) if n.startswith("ledger-") and n.endswith(".db"))
+        for old in names[:-BACKUP_KEEP]:
+            os.remove(os.path.join(BACKUP_DIR, old))
+    except Exception as e:  # un backup fallito non deve mai bloccare l'app
+        print(f"  ! backup automatico fallito: {e}")
+
+@app.before_request
+def _backup_once_a_day():
+    daily_backup()
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def row_to_dict(row): return dict(row) if row else None
@@ -1600,6 +1638,7 @@ def index():
 
 if __name__ == "__main__":
     init_db()
+    daily_backup()
     port = int(os.environ.get("PORT", 5001))
     host = os.environ.get("HOST", "127.0.0.1")  # solo locale: nessuna autenticazione
     url  = f"http://localhost:{port}"
