@@ -1564,6 +1564,8 @@ async function renderProjects() {
       const rawPct=p.total_budget?s.spent/p.total_budget*100:0;  // non clampato: serve per soglie warn/over
       const pct=Math.max(0,Math.min(rawPct,100));
       const rem=p.total_budget!=null?p.total_budget-s.spent:null;
+      // spent è la spesa netta: se negativa il progetto è in positivo (ottenuti, non speso)
+      const spentLbl=(s.spent<0?'ottenuti ':'speso ')+euroAbs(s.spent);
       const cls=rawPct>100?'over':rawPct>80?'warn':'';
       const txHtml=s.transactions.map(t=>{
         const ds=fmtDate(t.date,true);
@@ -1594,13 +1596,13 @@ async function renderProjects() {
             </div>
           </div>
           <div class="proj-amounts">
-            <span>speso ${euroAbs(s.spent)}</span>
+            <span>${spentLbl}</span>
             ${rem>=0
               ?`<span style="color:var(--green)">rimangono ${euroAbs(rem)}</span>`
               :`<span style="color:var(--red)">sforato di ${euroAbs(Math.abs(rem))}</span>`}
             <span>budget ${euroAbs(p.total_budget)}</span>
           </div>`
-          :`<div style="font-family:'DM Mono',monospace;font-size:12px;color:var(--muted2)">speso ${euroAbs(s.spent)} — nessun limite impostato</div>`}
+          :`<div style="font-family:'DM Mono',monospace;font-size:12px;color:var(--muted2)">${spentLbl} — nessun limite impostato</div>`}
         </div>
         <div class="proj-tx-list">${txHtml}</div>
       </div>`;
