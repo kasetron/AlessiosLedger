@@ -2,7 +2,7 @@
 """
 Ledger — personal finance tracker
 Run: python ledger.py
-Open: http://localhost:5001
+Open: http://localhost:5000
 """
 import sqlite3, os, re, json, uuid, calendar, webbrowser, threading
 from datetime import date, datetime
@@ -2166,7 +2166,7 @@ def index():
 if __name__ == "__main__":
     init_db()
     daily_backup()
-    port = int(os.environ.get("PORT", 5001))
+    port = int(os.environ.get("PORT", 5000))
     host = os.environ.get("HOST", "127.0.0.1")  # solo locale: nessuna autenticazione
     url  = f"http://localhost:{port}"
     print(f"\n  ╔═════════════════════════════════════╗")
