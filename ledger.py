@@ -4,12 +4,13 @@ Ledger — personal finance tracker
 Run: python ledger.py
 Open: http://localhost:5001
 """
-import sqlite3, os, json, webbrowser, threading
+import sqlite3, os, json, uuid, webbrowser, threading
 from datetime import date, datetime
 from flask import Flask, g, jsonify, request
 
 app = Flask(__name__)
 DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ledger.db")
+METHODS = ("Conto", "Paypal", "Contanti", "Libretto", "Risparmio")
 
 # ── DB ────────────────────────────────────────────────────────────────────────
 def get_db():
@@ -46,7 +47,8 @@ def init_db():
         date        TEXT    NOT NULL,
         description TEXT    NOT NULL DEFAULT '',
         is_balance  INTEGER NOT NULL DEFAULT 0,
-        project_id  INTEGER REFERENCES projects(id)
+        project_id  INTEGER REFERENCES projects(id),
+        transfer_id TEXT
     );
     CREATE TABLE IF NOT EXISTS categories (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -72,6 +74,8 @@ def init_db():
     cols = [r[1] for r in db.execute("PRAGMA table_info(transactions)").fetchall()]
     if 'project_id' not in cols:
         db.execute("ALTER TABLE transactions ADD COLUMN project_id INTEGER REFERENCES projects(id)")
+    if 'transfer_id' not in cols:
+        db.execute("ALTER TABLE transactions ADD COLUMN transfer_id TEXT")
 
     # seed categories if empty
     if not db.execute("SELECT 1 FROM categories LIMIT 1").fetchone():
@@ -105,7 +109,7 @@ def compute_rollover(db, year, month, skip_zero):
         "SELECT category, SUM(amount) as s FROM transactions "
         "WHERE strftime('%Y',date)=? AND strftime('%m',date)=? "
         "AND is_balance=0 AND category!='' AND method!='Risparmio' "
-        "AND project_id IS NULL "
+        "AND project_id IS NULL AND transfer_id IS NULL "
         "GROUP BY category",
         (str(prev_y), f"{prev_m:02d}")
     ).fetchall()
@@ -174,6 +178,9 @@ def add_tx():
 def update_tx(tid):
     d = request.json
     db = get_db()
+    row = db.execute("SELECT transfer_id FROM transactions WHERE id=?", (tid,)).fetchone()
+    if row and row["transfer_id"]:
+        return jsonify({"error": "usa /api/transfers per modificare un trasferimento"}), 400
     db.execute(
         "UPDATE transactions SET amount=?,method=?,category=?,date=?,description=?,is_balance=?,project_id=? WHERE id=?",
         (d["amount"], d["method"], d.get("category",""), d["date"],
@@ -182,10 +189,18 @@ def update_tx(tid):
     db.commit()
     return jsonify(row_to_dict(db.execute("SELECT * FROM transactions WHERE id=?", (tid,)).fetchone()))
 
+def delete_tx_and_pair(db, tid):
+    """Elimina la transazione; se è metà di un trasferimento elimina anche l'altra metà."""
+    row = db.execute("SELECT transfer_id FROM transactions WHERE id=?", (tid,)).fetchone()
+    if row and row["transfer_id"]:
+        db.execute("DELETE FROM transactions WHERE transfer_id=?", (row["transfer_id"],))
+    else:
+        db.execute("DELETE FROM transactions WHERE id=?", (tid,))
+
 @app.route("/api/txs/<int:tid>", methods=["DELETE"])
 def delete_tx(tid):
     db = get_db()
-    db.execute("DELETE FROM transactions WHERE id=?", (tid,))
+    delete_tx_and_pair(db, tid)
     db.commit()
     return jsonify({"ok": True})
 
@@ -193,9 +208,61 @@ def delete_tx(tid):
 def bulk_delete():
     ids = request.json.get("ids", [])
     db = get_db()
-    db.executemany("DELETE FROM transactions WHERE id=?", [(i,) for i in ids])
+    for i in ids:
+        delete_tx_and_pair(db, i)
     db.commit()
     return jsonify({"deleted": len(ids)})
+
+# ── API: Transfers ────────────────────────────────────────────────────────────
+# Un trasferimento tra metodi = due transazioni (−importo su "from", +importo su "to")
+# legate dallo stesso transfer_id. Non sono entrate né uscite: toccano solo i saldi.
+def parse_transfer(d):
+    try:
+        amount = round(float(d["amount"]), 2)
+    except (KeyError, TypeError, ValueError):
+        return None
+    src, dst, day = d.get("from"), d.get("to"), d.get("date")
+    if amount <= 0 or src not in METHODS or dst not in METHODS or src == dst or not day:
+        return None
+    return amount, src, dst, day, d.get("description", "")
+
+def insert_transfer(db, transfer_id, p):
+    amount, src, dst, day, desc = p
+    db.executemany(
+        "INSERT INTO transactions(amount,method,category,date,description,is_balance,transfer_id) VALUES(?,?,?,?,?,0,?)",
+        [(-amount, src, "", day, desc, transfer_id), (amount, dst, "", day, desc, transfer_id)]
+    )
+
+@app.route("/api/transfers", methods=["POST"])
+def add_transfer():
+    p = parse_transfer(request.json or {})
+    if not p:
+        return jsonify({"error": "trasferimento non valido"}), 400
+    db = get_db()
+    transfer_id = uuid.uuid4().hex
+    insert_transfer(db, transfer_id, p)
+    db.commit()
+    return jsonify({"transfer_id": transfer_id}), 201
+
+@app.route("/api/transfers/<transfer_id>", methods=["PUT"])
+def update_transfer(transfer_id):
+    p = parse_transfer(request.json or {})
+    if not p:
+        return jsonify({"error": "trasferimento non valido"}), 400
+    db = get_db()
+    if not db.execute("SELECT 1 FROM transactions WHERE transfer_id=?", (transfer_id,)).fetchone():
+        return jsonify({"error": "trasferimento non trovato"}), 404
+    db.execute("DELETE FROM transactions WHERE transfer_id=?", (transfer_id,))
+    insert_transfer(db, transfer_id, p)
+    db.commit()
+    return jsonify({"transfer_id": transfer_id})
+
+@app.route("/api/transfers/<transfer_id>", methods=["DELETE"])
+def delete_transfer(transfer_id):
+    db = get_db()
+    db.execute("DELETE FROM transactions WHERE transfer_id=?", (transfer_id,))
+    db.commit()
+    return jsonify({"ok": True})
 
 # ── API: Balances ─────────────────────────────────────────────────────────────
 @app.route("/api/balances")
@@ -342,8 +409,8 @@ def restore():
         db.execute("INSERT INTO categories(id,name,grp,threshold,sort_order) VALUES(?,?,?,?,?)",
             (c["id"],c["name"],c["grp"],c.get("threshold"),c.get("sort_order",99)))
     for t in data.get("txs", []):
-        db.execute("INSERT INTO transactions(id,amount,method,category,date,description,is_balance,project_id) VALUES(?,?,?,?,?,?,?,?)",
-            (t["id"],t["amount"],t["method"],t.get("category",""),t["date"],t.get("description",""),int(t.get("is_balance",0)),t.get("project_id")))
+        db.execute("INSERT INTO transactions(id,amount,method,category,date,description,is_balance,project_id,transfer_id) VALUES(?,?,?,?,?,?,?,?,?)",
+            (t["id"],t["amount"],t["method"],t.get("category",""),t["date"],t.get("description",""),int(t.get("is_balance",0)),t.get("project_id"),t.get("transfer_id")))
     for co in data.get("carryovers", []):
         db.execute("INSERT INTO carryovers(year,month,category,amount) VALUES(?,?,?,?)",
             (co["year"],co["month"],co["category"],co["amount"]))
@@ -474,7 +541,7 @@ input[type=checkbox]{appearance:none;width:15px;height:15px;border:1px solid var
 input[type=checkbox]:checked{background:var(--gold);border-color:var(--gold)}
 input[type=checkbox]:checked::after{content:'✓';position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:9px;color:#0e0c09;font-weight:800}
 .pill{display:inline-block;padding:2px 8px;border-radius:4px;font-size:11px;font-family:'DM Mono',monospace;background:var(--surface3);color:var(--muted2)}
-.pill-Conto{background:#1a3a5520;color:var(--blue)}.pill-Paypal{background:var(--gold-dim);color:var(--gold)}.pill-Contanti{background:var(--green-dim);color:var(--green)}.pill-Libretto{background:#3d2a5020;color:var(--purple)}.pill-Risparmio{background:#e0a06020;color:var(--sav)}.pill-project{background:#3d2a5020;color:var(--purple)}
+.pill-Conto{background:#1a3a5520;color:var(--blue)}.pill-Paypal{background:var(--gold-dim);color:var(--gold)}.pill-Contanti{background:var(--green-dim);color:var(--green)}.pill-Libretto{background:#3d2a5020;color:var(--purple)}.pill-Risparmio{background:#e0a06020;color:var(--sav)}.pill-project{background:#3d2a5020;color:var(--purple)}.pill-transfer{background:var(--gold-dim);color:var(--gold)}
 .tx-amt{font-family:'DM Mono',monospace;font-size:13px;font-weight:500;text-align:right}
 .amt-pos{color:var(--green)}.amt-neg{color:var(--red)}.amt-neu{color:var(--muted)}
 .tx-date{font-family:'DM Mono',monospace;font-size:12px;color:var(--muted2)}
@@ -508,7 +575,7 @@ input[type=checkbox]:checked::after{content:'✓';position:absolute;top:50%;left
 .sign-row{display:flex;gap:8px}
 .sign-btns{display:flex;background:var(--surface2);border:1px solid var(--border);border-radius:8px;overflow:hidden}
 .sign-btn{background:none;border:none;color:var(--muted);font-size:18px;font-weight:700;width:44px;cursor:pointer;transition:all .15s;font-family:monospace}
-.sign-btn.is-neg{background:var(--red-dim);color:var(--red)}.sign-btn.is-pos{background:var(--green-dim);color:var(--green)}
+.sign-btn.is-neg{background:var(--red-dim);color:var(--red)}.sign-btn.is-pos{background:var(--green-dim);color:var(--green)}.sign-btn.is-xfer{background:var(--gold-dim);color:var(--gold)}
 .toggle-row{display:flex;align-items:center;gap:10px;padding:8px 0}
 .toggle-label{font-size:13px;color:var(--muted2);cursor:pointer;user-select:none}
 .toggle{position:relative;width:34px;height:19px;flex-shrink:0}
@@ -610,7 +677,7 @@ input[type=checkbox]:checked::after{content:'✓';position:absolute;top:50%;left
     <div class="card">
       <div class="card-title" style="margin-bottom:14px">
         Riepilogo mensile
-        <span style="color:var(--muted);font-size:9px;margin-left:8px;font-family:'DM Mono',monospace">saldi iniziali esclusi</span>
+        <span style="color:var(--muted);font-size:9px;margin-left:8px;font-family:'DM Mono',monospace">saldi iniziali e trasferimenti esclusi</span>
       </div>
       <div class="net-row">
         <div class="net-item"><div class="ni-label">Entrate</div><div class="ni-value" id="ni-in" style="color:var(--green)">—</div></div>
@@ -713,15 +780,17 @@ input[type=checkbox]:checked::after{content:'✓';position:absolute;top:50%;left
         <div class="sign-btns">
           <button class="sign-btn is-neg" id="btn-neg" onclick="setSign(-1)" type="button">−</button>
           <button class="sign-btn" id="btn-pos" onclick="setSign(1)" type="button">+</button>
+          <button class="sign-btn" id="btn-xfer" onclick="setSign(0)" type="button" title="Trasferimento tra metodi">⇄</button>
         </div>
         <input type="number" id="f-amount" placeholder="0.00" step="0.01" min="0" style="flex:1">
       </div>
     </div>
     <div class="field"><label>Descrizione</label><input type="text" id="f-desc" placeholder="es. spesa coop, lezione guida…"></div>
-    <div class="field"><label>Categoria / Progetto</label><div id="csel-fcat-m"></div></div>
-    <div class="field"><label>Metodo di pagamento</label><div id="csel-fmethod-m"></div></div>
+    <div class="field" id="field-cat"><label>Categoria / Progetto</label><div id="csel-fcat-m"></div></div>
+    <div class="field"><label id="lbl-method">Metodo di pagamento</label><div id="csel-fmethod-m"></div></div>
+    <div class="field" id="field-to" style="display:none"><label>A</label><div id="csel-fmethod-to"></div></div>
     <div class="field"><label>Data</label><input type="date" id="f-date"></div>
-    <div class="toggle-row">
+    <div class="toggle-row" id="row-isbal">
       <label class="toggle"><input type="checkbox" id="f-isbal"><span class="toggle-slider"></span></label>
       <span class="toggle-label" onclick="document.getElementById('f-isbal').click()">Saldo iniziale / riporto — escluso dal riepilogo</span>
     </div>
@@ -744,7 +813,7 @@ const MCOLOR={Conto:'#6ab0d4',Paypal:'#c9a84c',Contanti:'#6bbd82',Libretto:'#a88
 const today = new Date();
 let curYear  = today.getFullYear();
 let curMonth = today.getMonth()+1;
-let editId=null, sign=-1, sortCol='date', sortDir='desc';
+let editId=null, editTid=null, sign=-1, sortCol='date', sortDir='desc';
 let selectedIds=new Set();
 let showArchived=false;
 
@@ -816,7 +885,7 @@ class CS {
   }
 }
 
-let sFC, sFM, sFT, sNG, sMFC, sMFM;
+let sFC, sFM, sFT, sNG, sMFC, sMFM, sMTo;
 
 function buildCatModalOpts(keepProjId=null) {
   // progetti attivi + (in modifica) quello già assegnato, anche se archiviato
@@ -842,7 +911,7 @@ function initSelects() {
     ...STATE.projects.map(p=>({value:'proj:'+p.id, label:p.name, projItem:true})),
   ];
   const mOpts   = [{value:'',label:'Tutti i metodi'},...METHODS.map(m=>({value:m,label:m}))];
-  const tOpts   = [{value:'',label:'Tutto'},{value:'out',label:'Uscite'},{value:'in',label:'Entrate'},{value:'bal',label:'Saldi'}];
+  const tOpts   = [{value:'',label:'Tutto'},{value:'out',label:'Uscite'},{value:'in',label:'Entrate'},{value:'bal',label:'Saldi'},{value:'xfer',label:'Trasf.'}];
   const gOpts   = [{value:'NECESSARIE',label:'Necessarie'},{value:'AGGIUNTIVE',label:'Aggiuntive'}];
 
   if (!sFC) {
@@ -852,6 +921,7 @@ function initSelects() {
     sNG  = new CS('csel-newgroup',gOpts, 'NECESSARIE', null, true);
     sMFC = new CS('csel-fcat-m',  buildCatModalOpts(), '', v=>{if(v==='cat:guadagni')setSign(1);});
     sMFM = new CS('csel-fmethod-m', METHODS.map(m=>({value:m,label:m})), 'Conto', null);
+    sMTo = new CS('csel-fmethod-to', METHODS.map(m=>({value:m,label:m})), 'Contanti', null);
   } else {
     sFC.setOpts(catOpts, true);
     sMFC.setOpts(buildCatModalOpts(), true);
@@ -899,6 +969,23 @@ function renderBalances() {
     </div>`;
 }
 
+// Lista per la UI: ogni trasferimento (coppia di movimenti con lo stesso transfer_id)
+// diventa UNA riga {isTransfer, from, to, amount>0}; il resto resta invariato e in ordine.
+function mergedTxs() {
+  const legs={};
+  STATE.txs.forEach(t=>{ if(t.transfer_id) (legs[t.transfer_id]=legs[t.transfer_id]||[]).push(t); });
+  const seen=new Set(), rows=[];
+  STATE.txs.forEach(t=>{
+    if(!t.transfer_id){rows.push(t);return;}
+    if(seen.has(t.transfer_id))return;
+    seen.add(t.transfer_id);
+    const out=legs[t.transfer_id].find(x=>x.amount<0), inn=legs[t.transfer_id].find(x=>x.amount>0);
+    if(out&&inn) rows.push({...out, isTransfer:true, from:out.method, to:inn.method, amount:inn.amount});
+    else rows.push(...legs[t.transfer_id]);  // metà orfana: resta visibile come riga normale
+  });
+  return rows;
+}
+
 // Spesa netta per categoria del mese corrente (rimborsi in categoria sottraggono),
 // coerente con il calcolo del riporto. Esclude saldi, Risparmio e transazioni di progetto.
 function catSpend() {
@@ -916,8 +1003,10 @@ const fmtDate=(s,withYear=false)=>{const [y,m,d]=s.split('-');return `${d}/${m}$
 
 // ── Overview ──
 function renderOverview() {
-  const real=STATE.txs.filter(t=>!t.is_balance);
-  const sav =real.filter(t=>t.method==='Risparmio'&&t.amount<0).reduce((a,t)=>a+Math.abs(t.amount),0);
+  const real=STATE.txs.filter(t=>!t.is_balance&&!t.transfer_id);
+  // i trasferimenti non sono entrate/uscite, ma quelli verso/da Risparmio contano come risparmio
+  const savX=mergedTxs().filter(t=>t.isTransfer).reduce((a,t)=>a+(t.to==='Risparmio'?t.amount:0)-(t.from==='Risparmio'?t.amount:0),0);
+  const sav =real.filter(t=>t.method==='Risparmio'&&t.amount<0).reduce((a,t)=>a+Math.abs(t.amount),0)+savX;
   const inc =real.filter(t=>t.amount>0&&t.method!=='Risparmio').reduce((a,t)=>a+t.amount,0);
   const exp =real.filter(t=>t.amount<0&&t.method!=='Risparmio').reduce((a,t)=>a+t.amount,0);
   const net =inc+exp;
@@ -1012,6 +1101,7 @@ function renderTrend() {
 
 // ── Tx table ──
 function txCatLabel(t) {
+  if (t.isTransfer) return '<span class="pill pill-transfer">⇄ trasferimento</span>';
   if (t.project_id) {
     const p=STATE.projects.find(p=>p.id===t.project_id);
     return p ? `<span class="pill pill-project">▸ ${esc(p.name)}</span>` : `<span class="pill pill-project">progetto #${t.project_id}</span>`;
@@ -1023,18 +1113,21 @@ function visibleTxs() {
   const search=(document.getElementById('search-input')?.value||'').toLowerCase();
   const catF=sFC?.value||'', methF=sFM?.value||'', typeF=sFT?.value||'';
 
-  return STATE.txs.filter(t=>{
+  return mergedTxs().filter(t=>{
     if(search&&!t.description.toLowerCase().includes(search)
+      &&!(t.isTransfer&&'trasferimento'.includes(search))
       &&!(t.category||'').toLowerCase().includes(search)
       &&!(STATE.projects.find(p=>p.id===t.project_id)?.name||'').toLowerCase().includes(search)) return false;
     if(catF) {
+      if(t.isTransfer) return false;
       if(catF.startsWith('cat:') && t.category!==(catF.slice(4))) return false;
       if(catF.startsWith('proj:') && t.project_id!==parseInt(catF.slice(5))) return false;
     }
-    if(methF&&t.method!==methF) return false;
-    if(typeF==='out'&&(t.amount>=0||t.is_balance)) return false;
-    if(typeF==='in'&&(t.amount<=0||t.is_balance)) return false;
+    if(methF&&t.method!==methF&&!(t.isTransfer&&t.to===methF)) return false;
+    if(typeF==='out'&&(t.amount>=0||t.is_balance||t.isTransfer)) return false;
+    if(typeF==='in'&&(t.amount<=0||t.is_balance||t.isTransfer)) return false;
     if(typeF==='bal'&&!t.is_balance) return false;
+    if(typeF==='xfer'&&!t.isTransfer) return false;
     return true;
   });
 }
@@ -1059,7 +1152,7 @@ function renderTxTable() {
   if(!rows.length){tbody.innerHTML='<tr><td colspan="6"><div class="empty-state">Nessuna transazione trovata</div></td></tr>';return;}
   tbody.innerHTML=rows.map(t=>{
     const ds=fmtDate(t.date);
-    const amtCls=t.is_balance?'amt-neu':t.amount>=0?'amt-pos':'amt-neg';
+    const amtCls=t.is_balance||t.isTransfer?'amt-neu':t.amount>=0?'amt-pos':'amt-neg';
     const sel=selectedIds.has(t.id);
     return `<tr class="${t.is_balance?'tx-balance':''} ${sel?'tx-selected':''}" onclick="rowClick(event,${t.id})">
       <td class="td-check" onclick="event.stopPropagation()">
@@ -1068,8 +1161,8 @@ function renderTxTable() {
       <td><span class="tx-date">${ds}</span></td>
       <td>${esc(t.description)||'—'}${t.is_balance?'<span style="font-size:10px;color:var(--muted);margin-left:6px">↩</span>':''}</td>
       <td class="hide-sm">${txCatLabel(t)}</td>
-      <td class="hide-sm"><span class="pill pill-${t.method}">${t.method}</span></td>
-      <td><span class="tx-amt ${amtCls}">${euroSgn(t.amount)}</span></td>
+      <td class="hide-sm">${t.isTransfer?`<span class="pill pill-${t.from}">${t.from}</span> → <span class="pill pill-${t.to}">${t.to}</span>`:`<span class="pill pill-${t.method}">${t.method}</span>`}</td>
+      <td><span class="tx-amt ${amtCls}">${t.isTransfer?euroAbs(t.amount):euroSgn(t.amount)}</span></td>
     </tr>`;
   }).join('');
   document.getElementById('check-all').checked=rows.length>0&&rows.every(t=>selectedIds.has(t.id));
@@ -1288,27 +1381,30 @@ async function deleteProject(id) {
 
 // ── Modal ──
 function openModal(id=null) {
-  editId=id;
+  editId=id; editTid=null;
   sMFC.setOpts(buildCatModalOpts(STATE.txs.find(t=>t.id===id)?.project_id??null), false);
 
   if (id) {
     const tx=STATE.txs.find(t=>t.id===id); if(!tx)return;
-    document.getElementById('modal-title').textContent='Modifica transazione';
-    document.getElementById('f-amount').value=Math.abs(tx.amount);
+    const xfer=tx.transfer_id?mergedTxs().find(r=>r.isTransfer&&r.transfer_id===tx.transfer_id):null;
+    if(xfer) editTid=xfer.transfer_id;
+    document.getElementById('modal-title').textContent=xfer?'Modifica trasferimento':'Modifica transazione';
+    document.getElementById('f-amount').value=Math.abs(xfer?xfer.amount:tx.amount);
     document.getElementById('f-desc').value=tx.description;
     // restore cat/project selection
     if (tx.project_id) sMFC.value='proj:'+tx.project_id;
     else sMFC.value=tx.category?'cat:'+tx.category:'';
-    sMFM.value=tx.method;
+    sMFM.value=xfer?xfer.from:tx.method;
+    if(xfer) sMTo.value=xfer.to;
     document.getElementById('f-date').value=tx.date;
     document.getElementById('f-isbal').checked=!!tx.is_balance;
     document.getElementById('btn-del-tx').style.display='block';
-    setSign(tx.amount>=0?1:-1);
+    setSign(xfer?0:tx.amount>=0?1:-1);
   } else {
     document.getElementById('modal-title').textContent='Nuova transazione';
     document.getElementById('f-amount').value='';
     document.getElementById('f-desc').value='';
-    sMFC.value=''; sMFM.value='Conto';
+    sMFC.value=''; sMFM.value='Conto'; sMTo.value='Contanti';
     document.getElementById('f-isbal').checked=false;
     document.getElementById('btn-del-tx').style.display='none';
     const d=new Date();
@@ -1316,6 +1412,10 @@ function openModal(id=null) {
     document.getElementById('f-date').value=`${curYear}-${String(curMonth).padStart(2,'0')}-${String(day).padStart(2,'0')}`;
     setSign(-1);
   }
+  // un trasferimento esistente resta tale; una transazione esistente non diventa trasferimento
+  document.getElementById('btn-neg').style.display=editTid?'none':'';
+  document.getElementById('btn-pos').style.display=editTid?'none':'';
+  document.getElementById('btn-xfer').style.display=(id&&!editTid)?'none':'';
   document.getElementById('modal').style.display='flex';
   setTimeout(()=>document.getElementById('f-amount').focus(),80);
 }
@@ -1325,6 +1425,13 @@ function setSign(s){
   sign=s;
   document.getElementById('btn-neg').className='sign-btn'+(s===-1?' is-neg':'');
   document.getElementById('btn-pos').className='sign-btn'+(s===1?' is-pos':'');
+  document.getElementById('btn-xfer').className='sign-btn'+(s===0?' is-xfer':'');
+  // in modalità trasferimento: niente categoria/saldo iniziale, "Metodo" diventa "Da" e compare "A"
+  const x=s===0;
+  document.getElementById('field-cat').style.display=x?'none':'';
+  document.getElementById('row-isbal').style.display=x?'none':'';
+  document.getElementById('field-to').style.display=x?'':'none';
+  document.getElementById('lbl-method').textContent=x?'Da':'Metodo di pagamento';
 }
 
 async function saveTx() {
@@ -1332,6 +1439,15 @@ async function saveTx() {
   if(isNaN(raw)||raw<0){alert('Importo non valido');return;}
   const date=document.getElementById('f-date').value;
   if(!date){alert('Inserisci una data');return;}
+
+  if(sign===0){
+    if(!(raw>0)){alert('Importo non valido');return;}
+    if(sMFM.value===sMTo.value){alert('Scegli due metodi diversi');return;}
+    const body={amount:raw, from:sMFM.value, to:sMTo.value, date, description:document.getElementById('f-desc').value.trim()};
+    if(editTid) await api(`/api/transfers/${editTid}`,{method:'PUT',body});
+    else        await api('/api/transfers',           {method:'POST',body});
+    closeModal(); await render(); return;
+  }
 
   // parse cat/project from unified select
   const selVal = sMFC.value || '';
@@ -1359,7 +1475,8 @@ async function saveTx() {
 
 async function deleteTx() {
   if(!editId||!confirm('Eliminare questa transazione?'))return;
-  await api(`/api/txs/${editId}`,{method:'DELETE'});
+  if(editTid) await api(`/api/transfers/${editTid}`,{method:'DELETE'});
+  else        await api(`/api/txs/${editId}`,{method:'DELETE'});
   closeModal(); await render();
 }
 
@@ -1419,7 +1536,7 @@ async function importBackup(e) {
     if(!data.txs||!data.cats)throw 0;
     if(!confirm(`Importare ${data.txs.length} transazioni? I dati attuali saranno sovrascritti.`))return;
     await api('/api/restore',{method:'POST',body:data});
-    sFC=sFM=sFT=sNG=sMFC=sMFM=null;
+    sFC=sFM=sFT=sNG=sMFC=sMFM=sMTo=null;
     showToast('Backup ripristinato');
     await render();
   } catch{alert('File non valido');}
