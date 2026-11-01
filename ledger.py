@@ -885,6 +885,45 @@ class CS {
   }
 }
 
+// Stesso menu del dialog, due scelte indipendenti: una categoria (radio) e, in fondo,
+// un progetto opzionale (toggle). Valore: {cat:string, proj:number|null}
+class CSMix extends CS {
+  setOpts(opts, keepVal=false) {
+    this.opts=opts;
+    if(!keepVal) this.val={cat:'',proj:null};
+    this._render();
+  }
+  _label() {
+    const parts=[];
+    if(this.val.cat) parts.push(this.val.cat);
+    if(this.val.proj){const p=STATE.projects.find(p=>p.id===this.val.proj); parts.push('▸ '+(p?p.name:'progetto #'+this.val.proj));}
+    return parts.join(' · ');
+  }
+  _render() {
+    const lbl=this._label();
+    this.btn.textContent=lbl||'— nessuna —';
+    this.btn.style.color=lbl?'var(--text)':'var(--muted)';
+    this.ul.innerHTML='';
+    this.opts.forEach(o=>{
+      const li=document.createElement('li');
+      if(o.header){li.className='csel-item csel-group-header';li.textContent=o.header;this.ul.appendChild(li);return;}
+      const sel=o.value===''?false:o.value.startsWith('proj:')?this.val.proj===parseInt(o.value.slice(5)):this.val.cat===o.value.slice(4);
+      li.className='csel-item'+(o.projItem?' csel-proj-item':'')+(sel?' csel-sel':'')+(o.value===''?' csel-ph':'');
+      li.textContent=o.label;
+      li.addEventListener('click', e=>{
+        e.stopPropagation();
+        const prevCat=this.val.cat;
+        if(o.value==='') this.val={cat:'',proj:null};
+        else if(o.value.startsWith('proj:')){const id=parseInt(o.value.slice(5)); this.val={...this.val,proj:this.val.proj===id?null:id};}
+        else {const c=o.value.slice(4); this.val={...this.val,cat:this.val.cat===c?'':c};}
+        this._render(); this.close_();
+        this.onCh&&this.onCh(this.val, this.val.cat!==prevCat);
+      });
+      this.ul.appendChild(li);
+    });
+  }
+}
+
 let sFC, sFM, sFT, sNG, sMFC, sMFM, sMTo;
 
 function buildCatModalOpts(keepProjId=null) {
@@ -919,7 +958,7 @@ function initSelects() {
     sFM  = new CS('csel-fmethod', mOpts,       '', ()=>renderTxTable(), true);
     sFT  = new CS('csel-ftype',   tOpts,       '', ()=>renderTxTable(), true);
     sNG  = new CS('csel-newgroup',gOpts, 'NECESSARIE', null, true);
-    sMFC = new CS('csel-fcat-m',  buildCatModalOpts(), '', v=>{if(v==='cat:guadagni')setSign(1);});
+    sMFC = new CSMix('csel-fcat-m', buildCatModalOpts(), {cat:'',proj:null}, (v,catChanged)=>{if(catChanged&&v.cat==='guadagni')setSign(1);});
     sMFM = new CS('csel-fmethod-m', METHODS.map(m=>({value:m,label:m})), 'Conto', null);
     sMTo = new CS('csel-fmethod-to', METHODS.map(m=>({value:m,label:m})), 'Contanti', null);
   } else {
@@ -1102,11 +1141,13 @@ function renderTrend() {
 // ── Tx table ──
 function txCatLabel(t) {
   if (t.isTransfer) return '<span class="pill pill-transfer">⇄ trasferimento</span>';
+  const cat=t.category?`<span class="pill">${esc(t.category)}</span>`:'';
+  let proj='';
   if (t.project_id) {
     const p=STATE.projects.find(p=>p.id===t.project_id);
-    return p ? `<span class="pill pill-project">▸ ${esc(p.name)}</span>` : `<span class="pill pill-project">progetto #${t.project_id}</span>`;
+    proj=`<span class="pill pill-project">${p?'▸ '+esc(p.name):'progetto #'+t.project_id}</span>`;
   }
-  return t.category ? `<span class="pill">${esc(t.category)}</span>` : '<span style="color:var(--muted)">—</span>';
+  return cat||proj ? cat+(cat&&proj?' ':'')+proj : '<span style="color:var(--muted)">—</span>';
 }
 
 function visibleTxs() {
@@ -1280,7 +1321,7 @@ async function renderProjects() {
         const ds=fmtDate(t.date,true);
         return `<div class="proj-tx-item">
           <span class="proj-tx-date">${ds}</span>
-          <span class="proj-tx-desc">${esc(t.description)||'—'}</span>
+          <span class="proj-tx-desc">${esc(t.description)||'—'}${t.category?` <span class="pill" style="font-size:10px;margin-left:4px">${esc(t.category)}</span>`:''}</span>
           <span class="proj-tx-amt" style="color:${t.is_balance?'var(--muted)':t.amount>=0?'var(--green)':'var(--red)'}">${euroSgn(t.amount)}</span>
         </div>`;
       }).join('')||'<div style="color:var(--muted);font-size:12px;padding:6px 0">Nessuna spesa ancora — seleziona questo progetto quando aggiungi una transazione</div>';
@@ -1392,8 +1433,7 @@ function openModal(id=null) {
     document.getElementById('f-amount').value=Math.abs(xfer?xfer.amount:tx.amount);
     document.getElementById('f-desc').value=tx.description;
     // restore cat/project selection
-    if (tx.project_id) sMFC.value='proj:'+tx.project_id;
-    else sMFC.value=tx.category?'cat:'+tx.category:'';
+    sMFC.value={cat:tx.category||'', proj:tx.project_id||null};
     sMFM.value=xfer?xfer.from:tx.method;
     if(xfer) sMTo.value=xfer.to;
     document.getElementById('f-date').value=tx.date;
@@ -1404,7 +1444,7 @@ function openModal(id=null) {
     document.getElementById('modal-title').textContent='Nuova transazione';
     document.getElementById('f-amount').value='';
     document.getElementById('f-desc').value='';
-    sMFC.value=''; sMFM.value='Conto'; sMTo.value='Contanti';
+    sMFC.value={cat:'',proj:null}; sMFM.value='Conto'; sMTo.value='Contanti';
     document.getElementById('f-isbal').checked=false;
     document.getElementById('btn-del-tx').style.display='none';
     const d=new Date();
@@ -1449,16 +1489,8 @@ async function saveTx() {
     closeModal(); await render(); return;
   }
 
-  // parse cat/project from unified select
-  const selVal = sMFC.value || '';
-  let category='', project_id=null;
-  if (selVal.startsWith('proj:')) {
-    project_id=parseInt(selVal.slice(5));
-    // use project name as category label for display in tx table
-    category='';
-  } else if (selVal.startsWith('cat:')) {
-    category=selVal.slice(4);
-  }
+  // categoria e progetto (entrambi opzionali) dal menu unificato
+  const {cat:category, proj:project_id} = sMFC.value;
 
   const payload={
     amount:sign*raw,
