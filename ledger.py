@@ -4,7 +4,7 @@ Ledger — personal finance tracker
 Run: python ledger.py
 Open: http://localhost:5001
 """
-import sqlite3, os, json, uuid, webbrowser, threading
+import sqlite3, os, re, json, uuid, webbrowser, threading
 from datetime import date, datetime
 from flask import Flask, g, jsonify, request
 
@@ -420,6 +420,46 @@ def project_spending(pid):
     ).fetchall()
     return jsonify({"spent": round(-row["total"], 2), "transactions": rows_to_list(txs)})
 
+# ── API: Analytics ────────────────────────────────────────────────────────────
+@app.route("/api/analytics")
+def analytics():
+    """Aggregati mensili per la tab Analisi, tra i mesi start e end (formato YYYY-MM).
+    - spend: spesa NETTA per (mese, categoria, metodo); esclude saldi iniziali, trasferimenti,
+      spese di progetto (che hanno un budget a parte) ed entrate ('guadagni'); le voci senza
+      categoria contano solo se sono uscite.
+    - projects: spese nette dei progetti per (mese, metodo), tenute separate.
+    - balances: saldo di fine mese per metodo (tutto incluso: saldi iniziali, trasferimenti, progetti)."""
+    start, end = request.args.get("start", ""), request.args.get("end", "")
+    if not (re.fullmatch(r"\d{4}-\d{2}", start) and re.fullmatch(r"\d{4}-\d{2}", end)) or start > end:
+        return jsonify({"error": "intervallo non valido"}), 400
+    db = get_db()
+    spend = db.execute(
+        "SELECT substr(date,1,7) AS month, category, method, ROUND(-SUM(amount),2) AS amount "
+        "FROM transactions WHERE substr(date,1,7) BETWEEN ? AND ? "
+        "AND is_balance=0 AND transfer_id IS NULL AND project_id IS NULL "
+        "AND category!='guadagni' AND (category!='' OR amount<0) "
+        "GROUP BY month, category, method", (start, end)).fetchall()
+    projects = db.execute(
+        "SELECT substr(date,1,7) AS month, method, ROUND(-SUM(amount),2) AS amount "
+        "FROM transactions WHERE substr(date,1,7) BETWEEN ? AND ? "
+        "AND is_balance=0 AND project_id IS NOT NULL "
+        "GROUP BY month, method", (start, end)).fetchall()
+    running = {r["method"]: r["s"] for r in db.execute(
+        "SELECT method, SUM(amount) AS s FROM transactions WHERE substr(date,1,7) < ? GROUP BY method", (start,))}
+    per_month = {}
+    for r in db.execute(
+            "SELECT substr(date,1,7) AS month, method, SUM(amount) AS s FROM transactions "
+            "WHERE substr(date,1,7) BETWEEN ? AND ? GROUP BY month, method", (start, end)):
+        per_month.setdefault(r["month"], {})[r["method"]] = r["s"]
+    balances, y, m = [], int(start[:4]), int(start[5:])
+    while f"{y}-{m:02d}" <= end:
+        key = f"{y}-{m:02d}"
+        for meth, v in per_month.get(key, {}).items():
+            running[meth] = running.get(meth, 0.0) + v
+        balances.append({"month": key, "balances": {k: round(v, 2) for k, v in running.items()}})
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return jsonify({"spend": rows_to_list(spend), "projects": rows_to_list(projects), "balances": balances})
+
 # ── Backup / Restore ──────────────────────────────────────────────────────────
 @app.route("/api/backup")
 def backup():
@@ -677,6 +717,56 @@ input[type=checkbox]:checked::after{content:'✓';position:absolute;top:50%;left
 .divider{height:1px;background:var(--border);margin:8px 0}
 
 @media(max-width:600px){.header{padding:0 12px}.main{padding:14px 12px 60px}.hide-sm{display:none!important}.modal{padding:18px}.net-row{grid-template-columns:repeat(2,1fr)}}
+
+/* analisi */
+.balance-card.click{cursor:pointer}.balance-card.click:hover{border-color:var(--gold)}
+.an-filters{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:16px}
+.seg{display:inline-flex;border:1px solid var(--border);border-radius:8px;overflow:hidden;background:var(--surface)}
+.seg button{background:none;border:none;color:var(--muted);padding:7px 11px;font-size:12px;font-family:'DM Sans',sans-serif;cursor:pointer;transition:all .15s}
+.seg button+button{border-left:1px solid var(--border)}
+.seg button:hover{color:var(--text);background:var(--surface2)}
+.seg button.on{background:var(--gold-dim);color:var(--gold)}
+.an-cmp{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
+#an-body{transition:opacity .15s}
+.an-tiles{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:14px}
+@media(max-width:600px){.an-tiles{grid-template-columns:1fr}}
+.tile{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:14px 16px}
+.tile-l{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);font-family:'DM Mono',monospace;margin-bottom:6px}
+.tile-v{font-size:24px;font-weight:600;letter-spacing:-.5px;line-height:1.2}
+.tile-d{font-size:12px;margin-top:4px;color:var(--muted2)}
+.dl{font-family:'DM Mono',monospace;font-size:11px;color:var(--muted2)}.dl.up{color:var(--red)}.dl.down{color:var(--green)}
+.lg-row{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--muted2);margin-bottom:10px}
+.lg{display:inline-flex;align-items:center;gap:6px}.lg i{width:10px;height:10px;border-radius:2px;display:inline-block}
+.an-note{font-size:11px;color:var(--muted);margin-top:8px}
+.an-svg{width:100%;height:auto;display:block;overflow:visible}
+.an-svg text{font-family:'DM Mono',monospace;font-size:10px;fill:var(--muted)}
+.an-svg .hit{fill:transparent;outline:none}
+.an-svg .hit:hover,.an-svg .hit:focus{fill:rgba(240,235,224,.06)}
+.cmp-row{display:grid;grid-template-columns:130px 1fr 64px 64px 104px;gap:10px;align-items:center;padding:7px 8px;border-bottom:1px solid var(--border);border-radius:6px;cursor:pointer;outline:none;transition:background .1s}
+.cmp-row:hover,.cmp-row:focus{background:var(--surface2)}.cmp-row.sel{background:var(--gold-dim)}
+.cmp-row.head{cursor:default;font-size:10px;color:var(--muted);font-family:'DM Mono',monospace;text-transform:uppercase;letter-spacing:.5px;padding-top:0}
+.cmp-row.head:hover{background:none}
+.cmp-row.head .cmp-num{font-size:10px;color:var(--muted)}
+.cmp-row.total{cursor:default;border-bottom:none;font-weight:500}.cmp-row.total:hover{background:none}
+.cmp-name{font-size:13px;color:var(--muted2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.cmp-bars{display:flex;flex-direction:column;gap:2px}
+.cmp-bar{height:8px;border-radius:0 4px 4px 0;min-width:2px}
+.cmp-num{font-family:'DM Mono',monospace;font-size:12px;text-align:right}.cmp-num.b{color:var(--muted2)}
+@media(max-width:600px){.cmp-row{grid-template-columns:84px 1fr 54px 84px;gap:8px}.cmp-num{font-size:11px}.cmp-num.b{display:none}
+  .an-cmp{width:100%}.an-cmp>div{flex:1;min-width:0;width:auto!important}}
+.an-scroll{overflow-x:auto}
+.an-table{width:100%;border-collapse:collapse;font-family:'DM Mono',monospace;font-size:12px}
+.an-table th{font-size:10px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);font-weight:500;padding:8px;border-bottom:1px solid var(--border);text-align:right;white-space:nowrap}
+.an-table th:first-child,.an-table td:first-child{text-align:left;white-space:nowrap}
+.an-table td:first-child{font-family:'DM Sans',sans-serif;font-size:13px;color:var(--muted2)}
+.an-table td{padding:7px 8px;border-bottom:1px solid var(--border);text-align:right}
+.an-table td.z{color:var(--muted)}.an-table tr.foot td{font-weight:500;color:var(--text)}.an-table tr.sep td{border-top:1px solid var(--border2);color:var(--purple)}
+.an-tip{position:fixed;display:none;z-index:300;pointer-events:none;background:var(--surface2);border:1px solid var(--border2);border-radius:9px;padding:9px 12px;box-shadow:0 8px 24px rgba(0,0,0,.55);font-size:12px;min-width:150px;max-width:260px}
+.an-tip-t{font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--muted);font-family:'DM Mono',monospace;margin-bottom:6px}
+.an-tip-r{display:flex;align-items:center;gap:8px;padding:2px 0}
+.an-tip-r i{width:10px;height:3px;border-radius:2px;flex-shrink:0}.an-tip-r i.none{background:transparent}
+.an-tip-r b{font-family:'DM Mono',monospace;font-weight:500;color:var(--text);margin-left:auto;padding-left:12px}
+.an-tip-r span{color:var(--muted2)}
 </style>
 </head>
 <body>
@@ -706,6 +796,7 @@ input[type=checkbox]:checked::after{content:'✓';position:absolute;top:50%;left
   <div class="tabs">
     <button class="tab-btn active" onclick="switchTab('overview',this)">Panoramica</button>
     <button class="tab-btn" onclick="switchTab('transactions',this)">Transazioni</button>
+    <button class="tab-btn" id="tab-analysis" onclick="switchTab('analysis',this)">Analisi</button>
     <button class="tab-btn" onclick="switchTab('categories',this)">Categorie</button>
     <button class="tab-btn" onclick="switchTab('projects',this)">Progetti</button>
   </div>
@@ -764,6 +855,20 @@ input[type=checkbox]:checked::after{content:'✓';position:absolute;top:50%;left
         <tbody id="tx-body"></tbody>
       </table>
     </div>
+  </div>
+
+  <!-- Analisi -->
+  <div class="tab-pane" id="pane-analysis">
+    <div class="an-filters">
+      <div class="seg" id="seg-range"></div>
+      <div id="csel-amethod" style="width:140px"></div>
+      <div id="csel-acat" style="width:170px"></div>
+      <div class="an-cmp"><span>Confronta</span><div id="csel-aa" style="width:152px"></div><span>con</span><div id="csel-ab" style="width:152px"></div></div>
+      <div class="seg" id="seg-sort"></div>
+      <div class="seg" id="seg-view"></div>
+    </div>
+    <div id="an-body"></div>
+    <div class="an-tip" id="an-tip"></div>
   </div>
 
   <!-- Categorie -->
@@ -962,7 +1067,7 @@ class CSMix extends CS {
   }
 }
 
-let sFC, sFM, sFT, sNG, sMFC, sMFM, sMTo;
+let sFC, sFM, sFT, sNG, sMFC, sMFM, sMTo, sAM, sAC, sAA, sAB;
 
 function buildCatModalOpts(keepProjId=null) {
   // progetti attivi + (in modifica) quello già assegnato, anche se archiviato
@@ -999,6 +1104,10 @@ function initSelects() {
     sMFC = new CSMix('csel-fcat-m', buildCatModalOpts(), {cat:'',proj:null}, (v,catChanged)=>{if(catChanged&&v.cat==='guadagni')setSign(1);});
     sMFM = new CS('csel-fmethod-m', METHODS.map(m=>({value:m,label:m})), 'Conto', null);
     sMTo = new CS('csel-fmethod-to', METHODS.map(m=>({value:m,label:m})), 'Contanti', null);
+    sAM  = new CS('csel-amethod', [{value:'',label:'Tutti i metodi'},...METHODS.map(m=>({value:m,label:m}))], '', v=>{AN.method=v;renderAnalysis();}, true);
+    sAC  = new CS('csel-acat', [{value:'',label:'Tutte le categorie'}], '', v=>{AN.cat=v;renderAnalysis();}, true);
+    sAA  = new CS('csel-aa', [], '', v=>{AN.a=v;renderAnalysis();}, true);
+    sAB  = new CS('csel-ab', [], '', v=>{AN.b=v;renderAnalysis();}, true);
   } else {
     sFC.setOpts(catOpts, true);
     sMFC.setOpts(buildCatModalOpts(), true);
@@ -1029,6 +1138,7 @@ async function render() {
   renderTxTable();
   renderCatList();
   await renderProjects();
+  if(anActive()) await loadAnalysis();
 }
 
 // ── Balances ──
@@ -1036,11 +1146,11 @@ function renderBalances() {
   const b=STATE.balances;
   const avail=METHODS.filter(m=>m!=='Risparmio').reduce((a,m)=>a+(b[m]||0),0);
   document.getElementById('balance-strip').innerHTML=
-    METHODS.map(m=>`<div class="balance-card bc-${m}">
+    METHODS.map(m=>`<div class="balance-card click bc-${m}" onclick="openAnalysis('${m}')" title="Apri l'analisi di ${m}">
       <div class="b-label">${m}</div>
       <div class="b-value ${(b[m]||0)<0?'b-neg':''}">${euroAbs(b[m]||0)}</div>
     </div>`).join('')+
-    `<div class="balance-card bc-total">
+    `<div class="balance-card click bc-total" onclick="openAnalysis('')" title="Apri l'analisi">
       <div class="b-label">Disponibile</div>
       <div class="b-value ${avail<0?'b-neg':''}">${euroAbs(avail)}</div>
     </div>`;
@@ -1587,6 +1697,7 @@ function switchTab(name,btn) {
   document.querySelectorAll('.tab-pane').forEach(p=>p.classList.remove('active'));
   btn.classList.add('active');
   document.getElementById('pane-'+name).classList.add('active');
+  if(name==='analysis') loadAnalysis();
 }
 
 // ── Backup / Restore ──
@@ -1606,7 +1717,7 @@ async function importBackup(e) {
     if(!data.txs||!data.cats)throw 0;
     if(!confirm(`Importare ${data.txs.length} transazioni? I dati attuali saranno sovrascritti.`))return;
     await api('/api/restore',{method:'POST',body:data});
-    sFC=sFM=sFT=sNG=sMFC=sMFM=sMTo=null;
+    sFC=sFM=sFT=sNG=sMFC=sMFM=sMTo=sAM=sAC=sAA=sAB=null;
     showToast('Backup ripristinato');
     await render();
   } catch{alert('File non valido');}
@@ -1626,6 +1737,301 @@ document.addEventListener('keydown',e=>{
   if(e.key==='n'&&!e.target.matches('input,select,textarea,[contenteditable]')
     &&document.getElementById('modal').style.display==='none') openModal();
 });
+
+// ── Analisi ──
+// Colori (validati con validate_palette su sfondo #181410): mese in analisi / mese di
+// riferimento / altri mesi. Stessa assegnazione in tutti i grafici (il colore segue il mese).
+const AN_A='#b08a24', AN_B='#4a90d9', AN_DIM='#7a7265', AN_NONE='__none__';
+const AN={range:6, method:'', cat:'', a:null, b:null, sort:'spend', view:'chart', data:null, key:'', req:0};
+let AN_TIPS=[];
+
+const ymKey=(y,m)=>y+'-'+String(m).padStart(2,'0');
+function addMonths(ym,d){
+  let [y,m]=ym.split('-').map(Number); m+=d;
+  while(m>12){m-=12;y++;} while(m<1){m+=12;y--;}
+  return ymKey(y,m);
+}
+const monShort=ym=>SM[+ym.slice(5)-1];
+const monLong=ym=>MONTHS[+ym.slice(5)-1]+' '+ym.slice(0,4);
+const catName=c=>c===AN_NONE?'senza categoria':c;
+const fmtK=v=>{const a=Math.abs(v), s=v<0?'−':'';
+  return a>=1000 ? s+(a/1000).toFixed(a%1000?1:0).replace('.',',')+'K' : s+String(Math.round(a*100)/100).replace('.',',');};
+const lblK=v=>'€'+(v>=1000?fmtK(v):Math.round(v));
+const anActive=()=>document.getElementById('pane-analysis').classList.contains('active');
+
+function niceStep(raw){const mag=Math.pow(10,Math.floor(Math.log10(raw))), f=raw/mag; return (f<=1?1:f<=2?2:f<=5?5:10)*mag;}
+function niceTicks(max,n=4){
+  if(!(max>0)) return [0,1];
+  const step=niceStep(max/n), top=Math.ceil(max/step-1e-9)*step, t=[];
+  for(let v=0;v<=top+1e-9;v+=step) t.push(Math.round(v*100)/100);
+  return t;
+}
+function niceDomain(lo,hi,n=4){
+  if(hi<=lo) hi=lo+1;
+  const step=niceStep((hi-lo)/n), l=Math.floor(lo/step+1e-9)*step, h=Math.ceil(hi/step-1e-9)*step, t=[];
+  for(let v=l;v<=h+1e-9;v+=step) t.push(Math.round(v*100)/100);
+  return {lo:t[0], hi:t[t.length-1], ticks:t};
+}
+// colonna: spigolo arrotondato (4px) solo in alto, squadrato sulla linea di base
+function barPath(x,y,w,h,r=4){
+  if(!(h>0)) return '';
+  r=Math.min(r,h,w/2);
+  return `M${x} ${y+h}V${y+r}A${r} ${r} 0 0 1 ${x+r} ${y}H${x+w-r}A${r} ${r} 0 0 1 ${x+w} ${y+r}V${y+h}Z`;
+}
+function anDelta(cur,prev){
+  if(!(prev>0.005)) return cur>0.005?{cls:'up',txt:'nuovo'}:{cls:'',txt:'—'};
+  const p=(cur-prev)/prev*100;
+  return {cls:p>0.5?'up':p<-0.5?'down':'', txt:(p>0.5?'▲ +':p<-0.5?'▼ −':'• ')+Math.abs(p).toFixed(0)+'%'};
+}
+const tipId=t=>AN_TIPS.push(t)-1;
+
+// ── tooltip (testo sempre via textContent: i nomi sono dati dell'utente) ──
+function showTip(t){
+  const el=document.getElementById('an-tip'); el.replaceChildren();
+  const h=document.createElement('div'); h.className='an-tip-t'; h.textContent=t.title; el.appendChild(h);
+  t.rows.forEach(r=>{
+    const row=document.createElement('div'); row.className='an-tip-r';
+    const k=document.createElement('i'); if(r.color) k.style.background=r.color; else k.className='none';
+    const l=document.createElement('span'); l.textContent=r.label;
+    const v=document.createElement('b'); v.textContent=r.value;
+    row.append(k,l,v); el.appendChild(row);
+  });
+  el.style.display='block';
+}
+function placeTip(x,y){
+  const el=document.getElementById('an-tip'), w=el.offsetWidth, h=el.offsetHeight;
+  let L=x+14, T=y+14;
+  if(L+w>innerWidth-8) L=x-w-14;
+  if(T+h>innerHeight-8) T=y-h-14;
+  el.style.left=Math.max(8,L)+'px'; el.style.top=Math.max(8,T)+'px';
+}
+function hideTip(){
+  document.getElementById('an-tip').style.display='none';
+  const xh=document.getElementById('an-xh'), xd=document.getElementById('an-xd');
+  if(xh) xh.style.display='none'; if(xd) xd.style.display='none';
+}
+function bindTips(root){
+  const on=(t,x,y)=>{
+    showTip(AN_TIPS[+t.dataset.t]); placeTip(x,y);
+    const xh=document.getElementById('an-xh'), xd=document.getElementById('an-xd');
+    if(xh&&xd&&t.dataset.x){
+      xh.setAttribute('x1',t.dataset.x); xh.setAttribute('x2',t.dataset.x); xh.style.display='';
+      xd.setAttribute('cx',t.dataset.x); xd.setAttribute('cy',t.dataset.y); xd.style.display='';
+    }
+  };
+  root.addEventListener('pointermove',e=>{const t=e.target.closest('[data-t]'); t?on(t,e.clientX,e.clientY):hideTip();});
+  root.addEventListener('pointerleave',hideTip);
+  root.addEventListener('focusin',e=>{const t=e.target.closest('[data-t]'); if(t){const r=t.getBoundingClientRect(); on(t,r.left+r.width/2,r.top);}});
+  root.addEventListener('focusout',hideTip);
+}
+
+// ── dati ──
+async function loadAnalysis(){
+  const months=anMonths(), start=addMonths(months[0],-1), end=months[months.length-1];
+  const key=months[0]+'|'+end;
+  if(AN.key!==key){AN.key=key; AN.a=AN.b=null;}   // nuovo periodo → confronto di default
+  const my=++AN.req, body=document.getElementById('an-body');
+  if(AN.data) body.style.opacity=.5;                 // durante il ricaricamento resta il vecchio grafico
+  try {
+    const data=await api(`/api/analytics?start=${start}&end=${end}`);
+    if(my!==AN.req) return;
+    AN.data={...data, months:[start,...months]};
+    renderAnalysis();
+  } finally { if(my===AN.req) body.style.opacity=1; }
+}
+function anMonths(){
+  const end=ymKey(curYear,curMonth), n=AN.range==='year'?curMonth:AN.range;
+  return Array.from({length:n},(_,i)=>addMonths(end,i-(n-1)));
+}
+function anModel(){
+  const d=AN.data, months=anMonths(), all=d.months;
+  const rows=d.spend.filter(r=>AN.method?r.method===AN.method:r.method!=='Risparmio');
+  const byMC={};
+  rows.forEach(r=>{const c=r.category||AN_NONE, m=byMC[r.month]||(byMC[r.month]={}); m[c]=(m[c]||0)+r.amount;});
+  const val=(m,c)=>(byMC[m]&&byMC[m][c])||0;
+  const cats=[...new Set(rows.map(r=>r.category||AN_NONE))];
+  const total=m=>AN.cat?val(m,AN.cat):cats.reduce((s,c)=>s+val(m,c),0);
+  // di default si analizza l'ultimo mese del periodo CON spese (es. a inizio mese, quando quello
+  // in corso è ancora vuoto, si confronta il mese scorso col precedente invece di un "−100%" ovunque)
+  const a=AN.a&&all.includes(AN.a)?AN.a:([...months].reverse().find(m=>total(m)>.005)||months[months.length-1]);
+  let b=AN.b&&all.includes(AN.b)&&AN.b!==a?AN.b:addMonths(a,-1);
+  if(!all.includes(b)||b===a) b=all.find(m=>m!==a)||null;
+  const projRows=d.projects.filter(r=>!AN.method||r.method===AN.method);
+  const proj=m=>projRows.filter(r=>r.month===m).reduce((s,r)=>s+r.amount,0);
+  const bal=m=>{
+    const e=d.balances.find(x=>x.month===m); if(!e) return 0;
+    return AN.method?(e.balances[AN.method]||0)
+      :Object.entries(e.balances).filter(([k])=>k!=='Risparmio').reduce((s,[,v])=>s+v,0);
+  };
+  return {months, all, cats, val, total, a, b, proj, bal};
+}
+
+// ── render ──
+function segHTML(key,items){
+  return items.map(([v,l])=>`<button class="${String(AN[key])===String(v)?'on':''}" onclick="anSet('${key}','${v}')">${l}</button>`).join('');
+}
+function anSet(k,v){
+  AN[k]=(k==='range'&&v!=='year')?+v:v;
+  if(k==='range') loadAnalysis(); else renderAnalysis();
+}
+function anPickCat(c){ AN.cat=AN.cat===c?'':c; renderAnalysis(); }
+function openAnalysis(method){
+  AN.method=method;
+  switchTab('analysis',document.getElementById('tab-analysis'));
+}
+function anSyncControls(M){
+  document.getElementById('seg-range').innerHTML=segHTML('range',[['3','3 mesi'],['6','6 mesi'],['12','12 mesi'],['year','Anno']]);
+  document.getElementById('seg-sort').innerHTML=segHTML('sort',[['spend','Spesa'],['delta','Variazione']]);
+  document.getElementById('seg-view').innerHTML=segHTML('view',[['chart','Grafici'],['table','Tabella']]);
+  sAM.value=AN.method;
+  sAC.setOpts([{value:'',label:'Tutte le categorie'},
+    ...STATE.cats.filter(c=>c.name!=='guadagni').map(c=>({value:c.name,label:c.name})),
+    {value:AN_NONE,label:'senza categoria'}],true);
+  sAC.value=AN.cat;
+  const mo=M.all.map(m=>({value:m,label:monLong(m)}));
+  sAA.setOpts(mo,true); sAA.value=M.a;
+  sAB.setOpts(mo,true); sAB.value=M.b||'';
+}
+function renderAnalysis(){
+  if(!AN.data) return;
+  const M=anModel();
+  anSyncControls(M);
+  AN_TIPS=[]; hideTip();
+  document.getElementById('an-body').innerHTML = AN.view==='table'
+    ? anTableHTML(M)
+    : anTilesHTML(M)+anCardMonths(M)+anCardCompare(M)+anCardBalance(M);
+}
+const anScope=()=>(AN.cat?catName(AN.cat):'tutte le categorie')+' · '+(AN.method||'tutti i metodi');
+const anWidth=()=>Math.max(document.getElementById('an-body').clientWidth-42,280);
+const lgItem=(c,t)=>`<span class="lg"><i style="background:${c}"></i>${esc(t)}</span>`;
+
+function anTilesHTML(M){
+  const ta=M.total(M.a), tb=M.b?M.total(M.b):0, dl=anDelta(ta,tb);
+  const avg=M.months.reduce((s,m)=>s+M.total(m),0)/M.months.length;
+  const proj=M.months.reduce((s,m)=>s+M.proj(m),0);
+  return `<div class="an-tiles">
+    <div class="tile"><div class="tile-l">Spesa ${esc(monLong(M.a))}</div><div class="tile-v">${euroAbs(ta)}</div>
+      <div class="tile-d">${M.b?`<span class="dl ${dl.cls}">${dl.txt}</span> vs ${esc(monLong(M.b))} (${euroAbs(tb)})`:'—'}</div></div>
+    <div class="tile"><div class="tile-l">Media mensile</div><div class="tile-v">${euroAbs(avg)}</div>
+      <div class="tile-d">negli ultimi ${M.months.length} mesi · ${esc(anScope())}</div></div>
+    <div class="tile"><div class="tile-l">Progetti (a parte)</div><div class="tile-v">${euroAbs(proj)}</div>
+      <div class="tile-d">escluse dai grafici · stesso periodo</div></div>
+  </div>`;
+}
+
+function anCardMonths(M){
+  const W=anWidth(), H=230, L=44, R=8, T=14, B=26, pw=W-L-R, ph=H-T-B, n=M.months.length, band=pw/n;
+  const vals=M.months.map(m=>Math.max(0,M.total(m)));
+  const ticks=niceTicks(Math.max(...vals,1)), top=ticks[ticks.length-1];
+  const yy=v=>T+ph-(v/top)*ph;
+  let g='';
+  ticks.forEach(t=>{g+=`<line x1="${L}" x2="${W-R}" y1="${yy(t)}" y2="${yy(t)}" stroke="var(--border)" stroke-width="1"/>`
+    +`<text x="${L-8}" y="${yy(t)+3}" text-anchor="end">${fmtK(t)}</text>`;});
+  g+=`<line x1="${L}" x2="${W-R}" y1="${yy(0)}" y2="${yy(0)}" stroke="var(--border2)" stroke-width="1"/>`;
+  M.months.forEach((m,i)=>{
+    const v=vals[i], bw=Math.min(24,band*.6), x=L+i*band+(band-bw)/2;
+    const col=m===M.a?AN_A:m===M.b?AN_B:AN_DIM;
+    g+=`<path d="${barPath(x,yy(v),bw,yy(0)-yy(v))}" fill="${col}"/>`;
+    if((m===M.a||m===M.b)&&v>0&&band>=44) g+=`<text x="${x+bw/2}" y="${yy(v)-5}" text-anchor="middle" style="fill:var(--muted2)">${lblK(v)}</text>`;
+    const yr=(i===0||m.endsWith('-01'))?" '"+m.slice(2,4):'';
+    g+=`<text x="${x+bw/2}" y="${H-8}" text-anchor="middle">${monShort(m)}${yr}</text>`;
+    const pm=addMonths(m,-1), hasPrev=M.all.includes(pm), tot=M.total(m);
+    const rows=[{color:col,label:AN.cat?catName(AN.cat):'Spesa',value:euroAbs(tot)}];
+    if(hasPrev) rows.push({label:'vs '+monShort(pm),value:anDelta(tot,M.total(pm)).txt});
+    if(!AN.cat) [...M.cats].map(c=>[c,M.val(m,c)]).filter(x=>x[1]>.005).sort((p,q)=>q[1]-p[1]).slice(0,3)
+      .forEach(([c,vv])=>rows.push({label:catName(c),value:euroAbs(vv)}));
+    g+=`<rect class="hit" x="${L+i*band}" y="${T}" width="${band}" height="${ph+B}" data-t="${tipId({title:monLong(m),rows})}" tabindex="0" role="img" aria-label="${esc(monLong(m))}: ${euroAbs(tot)}"/>`;
+  });
+  return `<div class="card"><div class="card-head"><div class="card-title">Spesa per mese · ${esc(anScope())}</div></div>
+    <div class="lg-row">${lgItem(AN_A,monLong(M.a))}${M.b?lgItem(AN_B,monLong(M.b)):''}${lgItem(AN_DIM,'altri mesi')}</div>
+    <svg class="an-svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="group" aria-label="Spesa per mese">${g}</svg></div>`;
+}
+
+function anCardCompare(M){
+  const head=`<div class="card"><div class="card-head"><div class="card-title">Spesa per categoria${M.b?' · '+esc(monLong(M.a))+' vs '+esc(monLong(M.b)):''}</div></div>`;
+  if(!M.b) return head+'<div class="empty-state">Nessun altro mese con cui confrontare</div></div>';
+  const rows=M.cats.map(c=>({c,a:Math.max(0,M.val(M.a,c)),b:Math.max(0,M.val(M.b,c))}))
+    .filter(r=>r.a>.005||r.b>.005);
+  rows.sort(AN.sort==='delta'?(x,y)=>(y.a-y.b)-(x.a-x.b):(x,y)=>y.a-x.a||y.b-x.b);
+  if(!rows.length) return head+'<div class="empty-state">Nessuna spesa in questi mesi</div></div>';
+  const maxV=Math.max(...rows.flatMap(r=>[r.a,r.b]),1);
+  const sgn=d=>d>.005?'▲':d<-.005?'▼':'•';
+  const cls=d=>d>.005?'up':d<-.005?'down':'';
+  const lines=rows.map(r=>{
+    const d=r.a-r.b, dl=anDelta(r.a,r.b);
+    const tip={title:catName(r.c),rows:[
+      {color:AN_A,label:monLong(M.a),value:euroAbs(r.a)},
+      {color:AN_B,label:monLong(M.b),value:euroAbs(r.b)},
+      {label:'variazione',value:euroSgn(d)+' ('+dl.txt+')'}]};
+    return `<div class="cmp-row ${AN.cat===r.c?'sel':''}" data-cat="${esc(r.c)}" data-t="${tipId(tip)}" tabindex="0" role="button" aria-pressed="${AN.cat===r.c}">
+      <div class="cmp-name">${esc(catName(r.c))}</div>
+      <div class="cmp-bars"><div class="cmp-bar" style="width:${(r.a/maxV*100).toFixed(1)}%;background:${AN_A}"></div><div class="cmp-bar" style="width:${(r.b/maxV*100).toFixed(1)}%;background:${AN_B}"></div></div>
+      <div class="cmp-num">${euroAbs(r.a)}</div><div class="cmp-num b">${euroAbs(r.b)}</div>
+      <div class="cmp-num dl ${cls(d)}">${sgn(d)} ${euroSgn(d)}</div></div>`;
+  }).join('');
+  const ta=rows.reduce((s,r)=>s+r.a,0), tb=rows.reduce((s,r)=>s+r.b,0), td=ta-tb;
+  return head+`<div class="lg-row">${lgItem(AN_A,monLong(M.a))}${lgItem(AN_B,monLong(M.b))}</div>
+    <div class="cmp-row head"><div>categoria</div><div></div><div style="text-align:right">${esc(monShort(M.a))}</div><div class="cmp-num b" style="font-family:inherit">${esc(monShort(M.b))}</div><div style="text-align:right">variazione</div></div>
+    ${lines}
+    <div class="cmp-row total"><div class="cmp-name">Totale</div><div></div><div class="cmp-num">${euroAbs(ta)}</div><div class="cmp-num b">${euroAbs(tb)}</div><div class="cmp-num dl ${cls(td)}">${sgn(td)} ${euroSgn(td)}</div></div>
+    <div class="an-note">Clicca una categoria per vederne l'andamento nel grafico mensile.</div></div>`;
+}
+
+function anCardBalance(M){
+  const W=anWidth(), H=210, L=44, R=8, T=16, B=26, pw=W-L-R, ph=H-T-B, n=M.months.length, band=pw/n;
+  const vals=M.months.map(m=>M.bal(m));
+  const dom=niceDomain(Math.min(0,...vals),Math.max(0,...vals));
+  const yy=v=>T+ph-((v-dom.lo)/(dom.hi-dom.lo))*ph, xx=i=>L+band*(i+.5);
+  const col=AN.method?MCOLOR[AN.method]:AN_A;
+  let g='';
+  dom.ticks.forEach(t=>{g+=`<line x1="${L}" x2="${W-R}" y1="${yy(t)}" y2="${yy(t)}" stroke="${t===0?'var(--border2)':'var(--border)'}" stroke-width="1"/>`
+    +`<text x="${L-8}" y="${yy(t)+3}" text-anchor="end">${fmtK(t)}</text>`;});
+  const pts=vals.map((v,i)=>[xx(i),yy(v)]);
+  const line=pts.map((p,i)=>(i?'L':'M')+p[0].toFixed(1)+' '+p[1].toFixed(1)).join('');
+  const base=yy(Math.max(dom.lo,Math.min(0,dom.hi)));
+  g+=`<path d="${line}L${pts[n-1][0].toFixed(1)} ${base}L${pts[0][0].toFixed(1)} ${base}Z" fill="${col}" fill-opacity=".1"/>`;
+  g+=`<path d="${line}" fill="none" stroke="${col}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+  g+=`<line id="an-xh" x1="0" x2="0" y1="${T}" y2="${T+ph}" stroke="var(--muted)" stroke-width="1" style="display:none"/>`;
+  g+=`<circle id="an-xd" r="4" fill="${col}" stroke="var(--surface)" stroke-width="2" style="display:none"/>`;
+  const last=pts[n-1];
+  g+=`<circle cx="${last[0]}" cy="${last[1]}" r="4" fill="${col}" stroke="var(--surface)" stroke-width="2"/>`;
+  g+=`<text x="${Math.min(last[0],W-R-4)}" y="${last[1]-10}" text-anchor="end" style="fill:var(--muted2)">${vals[n-1]<0?'−':''}${euroAbs(vals[n-1])}</text>`;
+  M.months.forEach((m,i)=>{
+    const yr=(i===0||m.endsWith('-01'))?" '"+m.slice(2,4):'';
+    g+=`<text x="${xx(i)}" y="${H-8}" text-anchor="middle">${monShort(m)}${yr}</text>`;
+    const pv=i>0?vals[i-1]:null, v=vals[i];
+    const rows=[{color:col,label:AN.method||'Disponibile',value:(v<0?'−':'')+euroAbs(v)}];
+    if(pv!==null) rows.push({label:'vs '+monShort(M.months[i-1]),value:euroSgn(v-pv)});
+    g+=`<rect class="hit" x="${L+i*band}" y="${T}" width="${band}" height="${ph+B}" data-t="${tipId({title:monLong(m),rows})}" data-x="${xx(i)}" data-y="${yy(v)}" tabindex="0" role="img" aria-label="${esc(monLong(m))}: ${(v<0?'−':'')+euroAbs(v)}"/>`;
+  });
+  return `<div class="card"><div class="card-head"><div class="card-title">Saldo ${esc(AN.method||'disponibile (senza Risparmio)')} a fine mese</div></div>
+    <svg class="an-svg" viewBox="0 0 ${W} ${H}" width="${W}" height="${H}" role="group" aria-label="Saldo a fine mese">${g}</svg></div>`;
+}
+
+// vista tabella: stessi numeri dei grafici, senza bisogno di hover
+function anTableHTML(M){
+  const sum=c=>M.months.reduce((s,m)=>s+M.val(m,c),0);
+  const cats=M.cats.filter(c=>M.months.some(m=>Math.abs(M.val(m,c))>.005)).sort((x,y)=>sum(y)-sum(x));
+  const cell=v=>`<td class="${Math.abs(v)<.005?'z':''}">${Math.abs(v)<.005?'—':euroAbs(v)}</td>`;
+  const tot=m=>cats.reduce((s,c)=>s+M.val(m,c),0);
+  return `<div class="card"><div class="card-head"><div class="card-title">Spesa per categoria e mese · ${esc(AN.method||'tutti i metodi')}</div></div>
+    <div class="an-scroll"><table class="an-table"><thead><tr><th>categoria</th>${M.months.map(m=>`<th>${esc(monShort(m))} ${m.slice(2,4)}</th>`).join('')}<th>totale</th></tr></thead><tbody>
+    ${cats.map(c=>`<tr><td>${esc(catName(c))}</td>${M.months.map(m=>cell(M.val(m,c))).join('')}<td>${euroAbs(sum(c))}</td></tr>`).join('')}
+    <tr class="foot"><td>Totale</td>${M.months.map(m=>cell(tot(m))).join('')}<td>${euroAbs(M.months.reduce((s,m)=>s+tot(m),0))}</td></tr>
+    <tr class="sep"><td>Progetti (a parte)</td>${M.months.map(m=>cell(M.proj(m))).join('')}<td>${euroAbs(M.months.reduce((s,m)=>s+M.proj(m),0))}</td></tr>
+    <tr><td>Saldo a fine mese</td>${M.months.map(m=>`<td>${M.bal(m)<0?'−':''}${euroAbs(M.bal(m))}</td>`).join('')}<td></td></tr>
+    </tbody></table></div></div>`;
+}
+
+(function anInit(){
+  const body=document.getElementById('an-body');
+  bindTips(body);
+  body.addEventListener('click',e=>{const r=e.target.closest('[data-cat]'); if(r) anPickCat(r.dataset.cat);});
+  body.addEventListener('keydown',e=>{
+    if((e.key==='Enter'||e.key===' ')&&e.target.matches('[data-cat]')){e.preventDefault(); anPickCat(e.target.dataset.cat);}
+  });
+  let t; window.addEventListener('resize',()=>{clearTimeout(t); t=setTimeout(()=>{if(anActive()) renderAnalysis();},150);});
+})();
 
 render();
 </script>
